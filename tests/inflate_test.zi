@@ -1,0 +1,7 @@
+Inflate :: #import "inflate";
+Main :: () -> s32 {
+    compressed: [28]u8=.{31,139,8,0,0,0,0,0,2,255,203,72,205,201,201,87,200,64,144,0,128,136,249,229,17,0,0,0}; output: [64]u8
+    count:=Inflate.Gzip(compressed[:],output[:]); if count!=17 { print("FAIL gzip known answer: %\n",count); return 1 }
+    compressed[20]=0; if Inflate.Gzip(compressed[:],output[:])>=0 { print("FAIL gzip CRC corruption\n"); return 1 }
+    print("Bounded gzip checks passed\n"); return 0
+}

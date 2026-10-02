@@ -1,0 +1,84 @@
+// RFC 1951 DEFLATE and RFC 1952 gzip, implemented entirely in Ziran.
+// Callers own a bounded output buffer. Malformed trees, distance overruns,
+// truncated input, CRC mismatch and trailing streams are rejected.
+Bits :: struct { input: []u8; at: s32; value: u32; count: s32; valid: bool; }
+Tree :: struct { counts: [16]s32; symbols: [288]s32; valid: bool; }
+Read :: (bits: *Bits, count: s32) -> u32 {
+    while bits.count<count { if bits.at>=bits.input.count { bits.valid=false; return 0 }; bits.value |= cast(u32)bits.input[bits.at]<<cast(u32)bits.count; bits.at+=1; bits.count+=8 }
+    value:=bits.value&((cast(u32)1<<cast(u32)count)-cast(u32)1); bits.value>>=cast(u32)count; bits.count-=count; return value
+}
+Build :: (lengths: []s32) -> Tree {
+    tree: Tree; if lengths.count>288 { return tree }
+    for i: 0..cast(s32)lengths.count-1 { length:=lengths[i]; if length<0 || length>15 { return tree }; tree.counts[length]+=1 }
+    left: s32=1; for i: 1..15 { left=left*2-tree.counts[i]; if left<0 { return tree } }
+    offsets: [16]s32; for i: 1..14 { offsets[i+1]=offsets[i]+tree.counts[i] }
+    for i: 0..cast(s32)lengths.count-1 { length:=lengths[i]; if length>0 { tree.symbols[offsets[length]]=cast(s32)i; offsets[length]+=1 } }
+    tree.valid=tree.counts[0]!=lengths.count; return tree
+}
+Symbol :: (bits: *Bits, tree: *Tree) -> s32 {
+    if !tree.valid { bits.valid=false; return -1 }; code: s32; first: s32; index: s32
+    for length: 1..15 { code |= cast(s32)Read(bits,1); count:=tree.counts[length]; if code-first<count { return tree.symbols[index+code-first] }; index+=count; first=(first+count)*2; code*=2 }
+    bits.valid=false; return -1
+}
+LengthBase: [29]s32=.{3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+LengthBits: [29]s32=.{0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+DistanceBase: [30]s32=.{1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+DistanceBits: [30]s32=.{0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+Order: [19]s32=.{16,17,18,0,8,7,9,6,10,5,11,4,10,5,11,4,10,5,11};
+CodeOrder: [19]s32=.{16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+Deflate :: (input: []u8, output: []u8) -> s32 {
+    bits: Bits; bits.input=input; bits.valid=true; used: s32; last: bool
+    while !last && bits.valid {
+        last=Read(*bits,1)!=cast(u32)0; kind:=Read(*bits,2)
+        if kind==cast(u32)0 {
+            bits.value=0; bits.count=0; length:=Read(*bits,16); complement:=Read(*bits,16)
+            if (length^complement)!=cast(u32)65535 || length>cast(u32)(output.count-used) { return -1 }
+            for i: 0..cast(s32)length-1 { output[used]=cast(u8)Read(*bits,8); used+=1 }; continue
+        }
+        if kind==cast(u32)3 { return -1 }
+        literals: [288]s32; distances: [32]s32
+        if kind==cast(u32)1 {
+            for i: 0..143 { literals[i]=8 }; for i: 144..255 { literals[i]=9 }; for i: 256..279 { literals[i]=7 }; for i: 280..287 { literals[i]=8 }; for i: 0..31 { distances[i]=5 }
+        } else {
+            hlit:=cast(s32)Read(*bits,5)+257; hdist:=cast(s32)Read(*bits,5)+1; hclen:=cast(s32)Read(*bits,4)+4
+            if hlit>286 || hdist>32 { return -1 }; codes: [19]s32
+            for i: 0..hclen-1 { codes[CodeOrder[i]]=cast(s32)Read(*bits,3) }; tree:=Build(codes[:]); all: [320]s32; at: s32
+            while at<hlit+hdist && bits.valid {
+                symbol:=Symbol(*bits,*tree); if symbol<0 { return -1 }
+                if symbol<16 { all[at]=symbol; at+=1 }
+                else {
+                    repeated: s32; count: s32
+                    if symbol==16 { if at==0 { return -1 }; repeated=all[at-1]; count=cast(s32)Read(*bits,2)+3 }
+                    else if symbol==17 { count=cast(s32)Read(*bits,3)+3 }
+                    else if symbol==18 { count=cast(s32)Read(*bits,7)+11 }
+                    else { return -1 }
+                    if at+count>hlit+hdist { return -1 }; for i: 0..count-1 { all[at]=repeated; at+=1 }
+                }
+            }
+            for i: 0..hlit-1 { literals[i]=all[i] }; for i: 0..hdist-1 { distances[i]=all[hlit+i] }
+        }
+        if literals[256]==0 { return -1 }; lit:=Build(literals[:]); dist:=Build(distances[:])
+        while bits.valid {
+            symbol:=Symbol(*bits,*lit); if symbol<0 { return -1 }; if symbol==256 { break }
+            if symbol<256 { if used>=output.count { return -1 }; output[used]=cast(u8)symbol; used+=1; continue }
+            if symbol>285 { return -1 }; offset:=symbol-257; length:=LengthBase[offset]+cast(s32)Read(*bits,LengthBits[offset]); distance:=Symbol(*bits,*dist)
+            if distance<0 || distance>=30 { return -1 }; count:=DistanceBase[distance]+cast(s32)Read(*bits,DistanceBits[distance])
+            if count>used || length>output.count-used { return -1 }; for i: 0..length-1 { output[used]=output[used-count]; used+=1 }
+        }
+    }
+    if !bits.valid || bits.at!=input.count { return -1 }; return used
+}
+Crc32 :: (bytes: []u8) -> u32 {
+    crc: u32=0xffffffff; for i: 0..cast(s32)bytes.count-1 { crc ^= cast(u32)bytes[i]; for bit: 0..7 { crc=(crc>>cast(u32)1)^(cast(u32)0xedb88320&(cast(u32)0-(crc&cast(u32)1))) } }; return ~crc
+}
+Word :: (bytes: []u8, at: s32) -> u32 { value: u32; for i: 0..3 { value |= cast(u32)bytes[at+i]<<cast(u32)(i*8) }; return value }
+Gzip :: (input: []u8, output: []u8) -> s32 {
+    if input.count<18 || input[0]!=cast(u8)31 || input[1]!=cast(u8)139 || input[2]!=cast(u8)8 || (input[3]&cast(u8)224)!=cast(u8)0 { return -1 }
+    flags:=input[3]; at: s32=10; end:=cast(s32)input.count-8
+    if (flags&cast(u8)4)!=cast(u8)0 { if at+2>end { return -1 }; length:=cast(s32)input[at]+cast(s32)input[at+1]*256; at+=2+length }
+    if at>end { return -1 }
+    for flag: 3..4 { if (flags&(cast(u8)1<<cast(u8)flag))!=cast(u8)0 { while at<end && input[at]!=cast(u8)0 { at+=1 }; at+=1 } }
+    if (flags&cast(u8)2)!=cast(u8)0 { if at+2>end { return -1 }; expected:=cast(u32)input[at]|(cast(u32)input[at+1]<<cast(u32)8); if (Crc32(input[:at])&cast(u32)65535)!=expected { return -1 }; at+=2 }
+    if at>=end { return -1 }; count:=Deflate(input[at:end],output)
+    if count<0 || cast(u32)count!=Word(input,end+4) || Crc32(output[:count])!=Word(input,end) { return -1 }; return count
+}
