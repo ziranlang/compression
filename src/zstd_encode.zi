@@ -1,0 +1,765 @@
+using Frame :: #import "zstd_frame"
+using Tables :: #import "zstd_tables"
+using Vectors :: #import "std/vec"
+
+ZstdEncodeMode :: enum s32 { Balanced; High }
+
+#scope_file
+
+BlockSize :: 131072
+MaxInput :: 0xffffffff
+MaxSequences :: BlockSize / 4
+
+Writer :: struct {
+    data: []u8
+    at: s64
+    bits: u64
+    count: s32
+    full: bool
+}
+
+Byte :: (writer: *Writer, value: u8) {
+    if writer.at >= writer.data.count { writer.full = true; return }
+    writer.data[writer.at] = value
+    writer.at += 1
+}
+
+Bytes :: (writer: *Writer, input: []u8) {
+    if input.count > writer.data.count - writer.at { writer.full = true; return }
+    for index: cast(s64)0..input.count - 1 { writer.data[writer.at + index] = input[index] }
+    writer.at += input.count
+}
+
+Little :: (writer: *Writer, value: u64, bytes: s32) {
+    for index: cast(s32)0..bytes - 1 { Byte(writer, cast(u8)(value >> cast(u64)(index * 8))) }
+}
+
+Put :: (writer: *Writer, value: u64, width: s32) {
+    writer.bits |= value << cast(u64)writer.count
+    writer.count += width
+    while writer.count >= 8 {
+        Byte(writer, cast(u8)writer.bits)
+        writer.bits >>= 8
+        writer.count -= 8
+    }
+}
+
+Flush :: (writer: *Writer) {
+    if writer.count != 0 { Byte(writer, cast(u8)writer.bits) }
+    writer.bits = 0
+    writer.count = 0
+}
+
+EndStream :: (writer: *Writer) {
+    Put(writer, 1, 1)
+    Flush(writer)
+}
+
+EncodeTable :: struct {
+    states: [512]u16
+    starts: [53]s32
+    norms: [53]s32
+    max_bits: [53]s32
+    threshold: [53]s32
+    log: s32
+}
+
+EncodeTableBuild :: (table: *EncodeTable, counts: []s32, log: s32) {
+    decode: Tables.FseTable
+    unused Tables.FseBuild(*decode, counts, log)
+    size := cast(s32)1 << log
+    table.log = log
+    start: s32 = 0
+    for symbol: cast(s64)0..counts.count - 1 {
+        frequency := ifx counts[symbol] < 0 then 1 else counts[symbol]
+        table.starts[symbol] = start
+        table.norms[symbol] = frequency
+        width := log - Tables.Log2(frequency)
+        table.max_bits[symbol] = width
+        table.threshold[symbol] = (frequency << width) - size
+        start += frequency
+    }
+    for state: cast(s32)0..size - 1 {
+        entry := decode.entries[state]
+        symbol := entry.symbol
+        rank := (size + cast(s32)entry.base) >> cast(s32)entry.bits
+        table.states[table.starts[symbol] + rank - table.norms[symbol]] = cast(u16)state
+    }
+}
+
+StartState :: (table: *EncodeTable, symbol: u8) -> s32 {
+    return cast(s32)table.states[table.starts[symbol]]
+}
+
+Transition :: (writer: *Writer, table: *EncodeTable, symbol: u8, state: s32) -> s32 {
+    width := table.max_bits[symbol]
+    if state < table.threshold[symbol] { width -= 1 }
+    mask := (cast(s32)1 << width) - 1
+    Put(writer, cast(u64)(state & mask), width)
+    rank := (state + (cast(s32)1 << table.log)) >> width
+    return cast(s32)table.states[table.starts[symbol] + rank - table.norms[symbol]]
+}
+
+Normalize :: (frequencies: []s32, counts: []s32, total: s32, log: s32) {
+    size := cast(s32)1 << log
+    remaining := size
+    for symbol: cast(s64)0..frequencies.count - 1 {
+        frequency := frequencies[symbol]
+        if frequency == 0 { continue }
+        weight := frequency * size / total
+        if weight < 1 { weight = 1 }
+        counts[symbol] = weight
+        remaining -= weight
+    }
+    while remaining != 0 {
+        add := remaining > 0
+        best: s64 = 0
+        score: s32 = -2147483647
+        for symbol: cast(s64)0..frequencies.count - 1 {
+            if counts[symbol] == 0 || (!add && counts[symbol] == 1) { continue }
+            error := frequencies[symbol] * size - counts[symbol] * total
+            priority := ifx add then error else -error
+            if priority > score { score = priority; best = symbol }
+        }
+        delta: s32 = ifx add then 1 else -1
+        counts[best] += delta
+        remaining -= delta
+    }
+}
+
+// Invert the variable-width normalized-count representation in RFC 8878 §4.1.1.
+WriteDistribution :: (writer: *Writer, counts: []s32, log: s32) {
+    Put(writer, cast(u64)(log - 5), 4)
+    threshold := cast(s32)1 << log
+    remaining := threshold + 1
+    width := log + 1
+    symbol: s64 = 0
+    while remaining > 1 {
+        count := counts[symbol]
+        symbol += 1
+        value := count + 1
+        short_limit := 2 * threshold - 1 - remaining
+        if value < short_limit { Put(writer, cast(u64)value, width - 1) }
+        else {
+            if value >= threshold { value += short_limit }
+            Put(writer, cast(u64)value, width)
+        }
+        remaining -= ifx count < 0 then 1 else count
+        if count == 0 {
+            run: s32 = 0
+            while counts[symbol] == 0 { symbol += 1; run += 1 }
+            while run >= 3 { Put(writer, 3, 2); run -= 3 }
+            Put(writer, cast(u64)run, 2)
+        }
+        while remaining < threshold { threshold >>= 1; width -= 1 }
+    }
+    Flush(writer)
+}
+
+Alphabet :: struct { counts: [53]s32; last: s32; distinct: s32 }
+
+Record :: (alphabet: *Alphabet, symbol: u8) {
+    if alphabet.counts[symbol] == 0 { alphabet.distinct += 1 }
+    alphabet.counts[symbol] += 1
+    if cast(s32)symbol > alphabet.last { alphabet.last = cast(s32)symbol }
+}
+
+// A predefined table saves its description on small blocks. The largest
+// possible offset in our windows is covered by the predefined offset table.
+SequenceTable :: (writer: *Writer, table: *EncodeTable, alphabet: *Alphabet, total: s32,
+    predefined: []s32, predefined_log: s32, limit_log: s32, adaptive: bool) -> u8 {
+    if alphabet.distinct == 1 {
+        Byte(writer, cast(u8)alphabet.last)
+        table.states[0] = 0
+        table.starts[alphabet.last] = 0
+        table.norms[alphabet.last] = 1
+        table.max_bits[alphabet.last] = 0
+        table.threshold[alphabet.last] = 0
+        table.log = 0
+        return 1
+    }
+    if adaptive && total >= 64 {
+        log := Tables.Log2(total) - 1
+        if log < 6 { log = 6 }
+        if log > limit_log { log = limit_log }
+        counts: [53]s32
+        end := alphabet.last + 1
+        Normalize(alphabet.counts[:end], counts[:end], total, log)
+        WriteDistribution(writer, counts[:end], log)
+        EncodeTableBuild(table, counts[:end], log)
+        return 2
+    }
+    EncodeTableBuild(table, predefined, predefined_log)
+    return 0
+}
+
+Code :: struct { code: u8; width: u8; extra: u32 }
+
+LengthCode :: (length: s64, first: s32, direct_start: s32, base: []s32, bits: []s32) -> Code {
+    if length < base[0] { return .{code = cast(u8)(length - direct_start)} }
+    index := base.count - 1
+    while cast(s64)base[index] > length { index -= 1 }
+    return .{code = cast(u8)(first + cast(s32)index), width = cast(u8)bits[index], extra = cast(u32)(length - cast(s64)base[index])}
+}
+
+OffsetCode :: (value: s64) -> Code {
+    width := Tables.Log2(cast(s32)value)
+    return .{code = cast(u8)width, width = cast(u8)width, extra = cast(u32)(value - (cast(s64)1 << width))}
+}
+
+Sequence :: struct { literal: Code; match: Code; offset: Code }
+
+WriteSequences :: (writer: *Writer, sequences: []Sequence, adaptive: bool) {
+    count := sequences.count
+    if count < 128 { Byte(writer, cast(u8)count) }
+    else if count < 0x7f00 {
+        Byte(writer, cast(u8)(128 + (count >> 8)))
+        Byte(writer, cast(u8)count)
+    } else {
+        Byte(writer, 255)
+        Little(writer, cast(u64)(count - 0x7f00), 2)
+    }
+    if count == 0 || writer.full { return }
+    modes := writer.at
+    Byte(writer, 0)
+    if writer.full { return }
+    literals: Alphabet
+    offsets: Alphabet
+    matches: Alphabet
+    for index: cast(s64)0..count - 1 {
+        sequence := sequences[index]
+        Record(*literals, sequence.literal.code)
+        Record(*offsets, sequence.offset.code)
+        Record(*matches, sequence.match.code)
+    }
+    ll: EncodeTable
+    of: EncodeTable
+    ml: EncodeTable
+    literal_mode := SequenceTable(writer, *ll, *literals, cast(s32)count, Tables.LiteralDistribution[:], 6, 9, adaptive)
+    offset_mode := SequenceTable(writer, *of, *offsets, cast(s32)count, Tables.OffsetDistribution[:], 5, 8, adaptive)
+    match_mode := SequenceTable(writer, *ml, *matches, cast(s32)count, Tables.MatchDistribution[:], 6, 9, adaptive)
+    writer.data[modes] = (literal_mode << 6) | (offset_mode << 4) | (match_mode << 2)
+    last := sequences[count - 1]
+    literal_state := StartState(*ll, last.literal.code)
+    offset_state := StartState(*of, last.offset.code)
+    match_state := StartState(*ml, last.match.code)
+    Put(writer, cast(u64)last.literal.extra, cast(s32)last.literal.width)
+    Put(writer, cast(u64)last.match.extra, cast(s32)last.match.width)
+    Put(writer, cast(u64)last.offset.extra, cast(s32)last.offset.width)
+    index := count - 1
+    while index > 0 && !writer.full {
+        index -= 1
+        next := sequences[index]
+        offset_state = Transition(writer, *of, next.offset.code, offset_state)
+        match_state = Transition(writer, *ml, next.match.code, match_state)
+        literal_state = Transition(writer, *ll, next.literal.code, literal_state)
+        Put(writer, cast(u64)next.literal.extra, cast(s32)next.literal.width)
+        Put(writer, cast(u64)next.match.extra, cast(s32)next.match.width)
+        Put(writer, cast(u64)next.offset.extra, cast(s32)next.offset.width)
+    }
+    Put(writer, cast(u64)match_state, ml.log)
+    Put(writer, cast(u64)offset_state, of.log)
+    Put(writer, cast(u64)literal_state, ll.log)
+    EndStream(writer)
+}
+
+// Positions in the hash table are absolute plus one (zero is vacant). The
+// previous-link ring can only be read for positions strictly inside its window.
+Matcher :: struct {
+    heads: []u32
+    long_heads: []u32
+    links: []u32
+    input: []u8
+    mask: s64
+    shift: u32
+    attempts: s32
+}
+
+Word :: (input: []u8, at: s64) -> u32 {
+    return cast(u32)input[at] | (cast(u32)input[at + 1] << 8) |
+        (cast(u32)input[at + 2] << 16) | (cast(u32)input[at + 3] << 24)
+}
+
+Hash :: (matcher: *Matcher, word: u32) -> s64 {
+    return cast(s64)((word * cast(u32)0x9e3779b1) >> matcher.shift)
+}
+
+LongHash :: (matcher: *Matcher, first: u32, second: u32) -> s64 {
+    mixed := (first * cast(u32)0x9e3779b1) ^ (second * cast(u32)0x85ebca77)
+    return cast(s64)(mixed >> matcher.shift)
+}
+
+Insert :: (matcher: *Matcher, at: s64, slot: s64, long_slot: s64) {
+    matcher.links[at & matcher.mask] = matcher.heads[slot]
+    matcher.heads[slot] = cast(u32)(at + 1)
+    if long_slot >= 0 { matcher.long_heads[long_slot] = cast(u32)(at + 1) }
+}
+
+AddPositions :: (matcher: *Matcher, first: s64, end: s64) {
+    stop := end
+    if stop > matcher.input.count - 3 { stop = matcher.input.count - 3 }
+    for at: first..stop - 1 {
+        first_word := Word(matcher.input, at)
+        long_slot: s64 = -1
+        if matcher.long_heads.count != 0 && matcher.input.count - at >= 8 {
+            long_slot = LongHash(matcher, first_word, Word(matcher.input, at + 4))
+        }
+        Insert(matcher, at, Hash(matcher, first_word), long_slot)
+    }
+}
+
+Extend :: (input: []u8, at: s64, candidate: s64, length: s64, limit: s64) -> s64 {
+    found := length
+    while limit - found >= 8 && Word(input, at + found) == Word(input, candidate + found) &&
+        Word(input, at + found + 4) == Word(input, candidate + found + 4) { found += 8 }
+    if limit - found >= 4 && Word(input, at + found) == Word(input, candidate + found) { found += 4 }
+    while found < limit && input[at + found] == input[candidate + found] { found += 1 }
+    return found
+}
+
+Match :: struct { length: s64; distance: s64; value: s64; gain: s64 }
+
+OffsetValue :: (distance: s64, recent: []s64, literals: s64) -> s64 {
+    if literals != 0 && distance == recent[0] { return 1 }
+    if distance == recent[1] { return ifx literals == 0 then 1 else 2 }
+    if distance == recent[2] { return ifx literals == 0 then 2 else 3 }
+    if literals == 0 && distance == recent[0] - 1 { return 3 }
+    return distance + 3
+}
+
+Consider :: (best: *Match, matcher: *Matcher, at: s64, candidate: s64, limit: s64, recent: []s64,
+    literals: s64) {
+    length := Extend(matcher.input, at, candidate, 4, limit)
+    distance := at - candidate
+    value := OffsetValue(distance, recent, literals)
+    // Approximate literal savings and extra offset bits. Prefer the shorter
+    // distance when two equal length matches carry the same coding cost.
+    gain := 6 * length - cast(s64)Tables.Log2(cast(s32)value)
+    if gain > best.gain || (gain == best.gain && distance < best.distance) {
+        best.* = .{length = length, distance = distance, value = value, gain = gain}
+    }
+}
+
+FindMatch :: (matcher: *Matcher, at: s64, end: s64, recent: []s64, literals: s64) -> Match {
+    best: Match
+    if matcher.input.count - at < 4 { return best }
+    word := Word(matcher.input, at)
+    slot := Hash(matcher, word)
+    previous := matcher.heads[slot]
+    limit := end - at
+    long_slot: s64 = -1
+    tail: u32 = 0
+    if matcher.long_heads.count != 0 && matcher.input.count - at >= 8 {
+        tail = Word(matcher.input, at + 4)
+        long_slot = LongHash(matcher, word, tail)
+    }
+    if limit >= 4 {
+        size := matcher.mask + 1
+        oldest := at - size
+        // Check repeat distances even if they were displaced in the hash chain.
+        for id: cast(s32)0..3 {
+            distance := ifx id == 3 then recent[0] - 1 else recent[id]
+            if distance > 0 && distance <= at && distance <= size && Word(matcher.input, at - distance) == word {
+                Consider(*best, matcher, at, at - distance, limit, recent, literals)
+                if best.length == limit && best.value <= 3 { break }
+            }
+        }
+        // A distinct longer-prefix lookup bypasses crowded four-byte chains.
+        // It visits at most one candidate and keeps the shorter search bounded.
+        if long_slot >= 0 && limit >= 8 && best.length != limit {
+            candidate := cast(s64)matcher.long_heads[long_slot] - 1
+            if candidate >= 0 && candidate >= oldest && at - candidate != best.distance &&
+                Word(matcher.input, candidate) == word && Word(matcher.input, candidate + 4) == tail {
+                Consider(*best, matcher, at, candidate, limit, recent, literals)
+            }
+        }
+        for attempt: cast(s32)1..matcher.attempts {
+            candidate := cast(s64)previous - 1
+            if candidate < 0 || candidate < oldest || best.length == limit ||
+                (best.length >= 64 && attempt > 8) { break }
+            // The long-prefix probe has already covered a different part of
+            // the window. Spend the full chain budget on promising prefixes.
+            if long_slot >= 0 && attempt > 4 && best.length < 8 { break }
+            if at - candidate != best.distance && (best.length <= 6 ||
+                matcher.input[at + best.length - 3] == matcher.input[candidate + best.length - 3]) &&
+                Word(matcher.input, candidate) == word {
+                Consider(*best, matcher, at, candidate, limit, recent, literals)
+            }
+            previous = matcher.links[candidate & matcher.mask]
+        }
+    }
+    Insert(matcher, at, slot, long_slot)
+    return best
+}
+
+Parse :: (matcher: *Matcher, at: s64, end: s64, recent: []s64,
+    literals: []u8, sequences: []Sequence) -> s64, s64 {
+    pos := at
+    start := at
+    count: s64 = 0
+    used: s64 = 0
+    pending: Match
+    has_pending := false
+    while pos < end {
+        best := ifx has_pending then pending else FindMatch(matcher, pos, end, recent, pos - start)
+        has_pending = false
+        if best.length == 0 { pos += 1; continue }
+        next_pos := pos + 1
+        // Delay by one literal if it buys a better match. Reuse the search
+        // result on the next step, keeping each hash position inserted once.
+        if best.length < end - pos && end - next_pos >= 4 {
+            pending = FindMatch(matcher, next_pos, end, recent, next_pos - start)
+            has_pending = true
+            if pending.gain > best.gain + 7 { pos = next_pos; continue }
+            next_pos += 1
+        }
+        literal_count := pos - start
+        for index: cast(s64)0..literal_count - 1 { literals[used + index] = matcher.input[start + index] }
+        used += literal_count
+        sequences[count] = .{
+            literal = LengthCode(literal_count, 16, 0, Tables.LiteralBase[:], Tables.LiteralBits[:]),
+            match = LengthCode(best.length, 32, 3, Tables.MatchBase[:], Tables.MatchBits[:]),
+            offset = OffsetCode(best.value)}
+        count += 1
+        unused Tables.RecentOffset(recent, best.value, literal_count)
+        pos += best.length
+        AddPositions(matcher, next_pos, pos)
+        start = pos
+        has_pending = false
+    }
+    for index: start..end - 1 { literals[used] = matcher.input[index]; used += 1 }
+    return count, used
+}
+
+IsRun :: (input: []u8) -> bool {
+    if input.count < 2 { return false }
+    for index: cast(s64)1..input.count - 1 {
+        if input[index] != input[0] { return false }
+    }
+    return true
+}
+
+Huffman :: struct {
+    lengths: [256]u8
+    prefixes: [256]u16
+    weights: [256]u8
+    last: s32
+    cost: s64
+}
+
+// Two queues build the tree bottom up. Leaves have already been sorted by
+// frequency, so both the leaf and internal-node queues are monotone.
+HuffNodes :: struct {
+    frequencies: [511]s32
+    leaves: [256]s32
+    leaf_at: s32
+    internal_at: s32
+    leaf_count: s32
+}
+
+TakeNode :: (nodes: *HuffNodes, internal_end: s32) -> s32 {
+    if nodes.leaf_at < nodes.leaf_count {
+        leaf := nodes.leaves[nodes.leaf_at]
+        if nodes.internal_at >= internal_end || nodes.frequencies[leaf] <= nodes.frequencies[nodes.internal_at] {
+            nodes.leaf_at += 1
+            return leaf
+        }
+    }
+    node := nodes.internal_at
+    nodes.internal_at += 1
+    return node
+}
+
+HuffBuild :: (input: []u8, huffman: *Huffman) -> bool {
+    nodes: HuffNodes
+    nodes.internal_at = 256
+    for index: cast(s64)0..input.count - 1 { nodes.frequencies[input[index]] += 1 }
+    for symbol: cast(s32)0..255 {
+        frequency := nodes.frequencies[symbol]
+        if frequency == 0 { continue }
+        index := nodes.leaf_count
+        while index > 0 && nodes.frequencies[nodes.leaves[index - 1]] > frequency {
+            nodes.leaves[index] = nodes.leaves[index - 1]
+            index -= 1
+        }
+        nodes.leaves[index] = symbol
+        nodes.leaf_count += 1
+        huffman.last = symbol
+    }
+    if nodes.leaf_count < 2 { return false }
+    parents: [511]s32
+    end := 254 + nodes.leaf_count
+    for node: cast(s32)256..end {
+        left := TakeNode(*nodes, node)
+        right := TakeNode(*nodes, node)
+        parents[left] = node
+        parents[right] = node
+        nodes.frequencies[node] = nodes.frequencies[left] + nodes.frequencies[right]
+    }
+    depths: [511]s32
+    node := end - 1
+    while node >= 256 { depths[node] = depths[parents[node]] + 1; node -= 1 }
+    lengths: [12]s32
+    excess := -(cast(s32)1 << 11)
+    table_log: s32 = 0
+    for index: cast(s32)0..nodes.leaf_count - 1 {
+        symbol := nodes.leaves[index]
+        depth := depths[parents[symbol]] + 1
+        if depth > 11 { depth = 11 }
+        if depth > table_log { table_log = depth }
+        huffman.lengths[symbol] = cast(u8)depth
+        lengths[depth] += 1
+        excess += cast(s32)1 << (11 - depth)
+    }
+    // Redistribute capped lengths until the tree is complete again. Split a
+    // shorter code and remove a longest code, reducing the overshoot by one.
+    if excess > 0 {
+        for step: cast(s32)1..excess {
+            depth: s32 = 10
+            while lengths[depth] == 0 { depth -= 1 }
+            lengths[depth] -= 1
+            lengths[depth + 1] += 2
+            lengths[11] -= 1
+        }
+        depth := table_log
+        for index: cast(s32)0..nodes.leaf_count - 1 {
+            while lengths[depth] == 0 { depth -= 1 }
+            huffman.lengths[nodes.leaves[index]] = cast(u8)depth
+            lengths[depth] -= 1
+        }
+    }
+    // Zstandard's canonical ordering assigns the low prefixes to the
+    // longest codes first, then orders codes of the same width by symbol.
+    counts: [12]s32
+    for index: cast(s32)0..nodes.leaf_count - 1 {
+        symbol := nodes.leaves[index]
+        depth := cast(s32)huffman.lengths[symbol]
+        weight := table_log + 1 - depth
+        huffman.weights[symbol] = cast(u8)weight
+        counts[weight] += 1
+        huffman.cost += cast(s64)(nodes.frequencies[symbol] * depth)
+    }
+    next: [12]s32
+    for weight: cast(s32)2..table_log {
+        next[weight] = next[weight - 1] + (counts[weight - 1] << (weight - 2))
+    }
+    for symbol: cast(s32)0..huffman.last {
+        weight := cast(s32)huffman.weights[symbol]
+        if weight == 0 { continue }
+        huffman.prefixes[symbol] = cast(u16)(next[weight] >> (weight - 1))
+        next[weight] += cast(s32)1 << (weight - 1)
+    }
+    return true
+}
+
+WriteWeights :: (writer: *Writer, weights: []u8) {
+    frequencies: [12]s32
+    distinct: s32 = 0
+    for index: cast(s64)0..weights.count - 1 {
+        weight := weights[index]
+        if frequencies[weight] == 0 { distinct += 1 }
+        frequencies[weight] += 1
+    }
+    if distinct < 2 || weights.count < 3 { writer.full = true; return }
+    counts: [12]s32
+    Normalize(frequencies[:], counts[:], cast(s32)weights.count, 6)
+    WriteDistribution(writer, counts[:], 6)
+    table: EncodeTable
+    EncodeTableBuild(*table, counts[:], 6)
+    states: [2]s32
+    at := weights.count - 1
+    states[at & 1] = StartState(*table, weights[at])
+    at -= 1
+    states[at & 1] = StartState(*table, weights[at])
+    while at > 0 {
+        at -= 1
+        lane := at & 1
+        states[lane] = Transition(writer, *table, weights[at], states[lane])
+    }
+    Put(writer, cast(u64)states[1], table.log)
+    Put(writer, cast(u64)states[0], table.log)
+    EndStream(writer)
+}
+
+HuffStream :: (writer: *Writer, input: []u8, huffman: *Huffman) {
+    index := input.count
+    while index > 0 && !writer.full {
+        index -= 1
+        symbol := input[index]
+        Put(writer, cast(u64)huffman.prefixes[symbol], cast(s32)huffman.lengths[symbol])
+    }
+    EndStream(writer)
+}
+
+WriteHuffman :: (writer: *Writer, input: []u8) -> bool {
+    if input.count < 32 { return false }
+    huffman: Huffman
+    if !HuffBuild(input, *huffman) || (huffman.cost + 7) / 8 + 4 >= input.count { return false }
+    tree_data: [127]u8
+    tree := Writer.{data = tree_data[:]}
+    WriteWeights(*tree, huffman.weights[:huffman.last])
+    direct_size := cast(s64)(huffman.last + 1) / 2
+    direct := huffman.last <= 128 && (tree.full || direct_size <= tree.at)
+    if !direct && tree.full { return false }
+    tree_size := ifx direct then direct_size else tree.at
+    four := input.count > 1023
+    header: s64 = ifx !four then 3 else ifx input.count < 16384 then 4 else 5
+    jumps: s64 = ifx four then 6 else 0
+    if (huffman.cost + 7) / 8 + header + 1 + tree_size + jumps >= input.count { return false }
+    if writer.data.count - writer.at < header { return false }
+    block := Writer.{data = writer.data[writer.at + header:]}
+    if direct {
+        Byte(*block, cast(u8)(127 + huffman.last))
+        for index: cast(s64)0..direct_size - 1 {
+            high := huffman.weights[index * 2]
+            low: u8 = ifx index * 2 + 1 < huffman.last then huffman.weights[index * 2 + 1] else 0
+            Byte(*block, (high << 4) | low)
+        }
+    } else {
+        Byte(*block, cast(u8)tree_size)
+        Bytes(*block, tree_data[:tree_size])
+    }
+    if four {
+        jump_at := block.at
+        Little(*block, 0, 6)
+        if block.full { return false }
+        chunk := (input.count + 3) / 4
+        for stream: cast(s64)0..3 {
+            start := stream * chunk
+            stop := ifx stream == 3 then input.count else start + chunk
+            before := block.at
+            HuffStream(*block, input[start:stop], *huffman)
+            size := block.at - before
+            if stream != 3 {
+                block.data[jump_at + stream * 2] = cast(u8)size
+                block.data[jump_at + stream * 2 + 1] = cast(u8)(size >> 8)
+            }
+        }
+    } else { HuffStream(*block, input, *huffman) }
+    if block.full || block.at + header >= input.count { return false }
+    format: u64 = ifx header == 3 then 0 else cast(u64)(header - 2)
+    width: u64 = ifx header == 3 then 10 else ifx header == 4 then 14 else 18
+    value := 2 | (format << 2) | (cast(u64)input.count << 4) | (cast(u64)block.at << (4 + width))
+    Little(writer, value, cast(s32)header)
+    writer.at += block.at
+    return true
+}
+
+WriteRawLiterals :: (writer: *Writer, input: []u8) {
+    count := cast(u64)input.count
+    run := IsRun(input)
+    kind: u64 = ifx run then 1 else 0
+    if count < 32 { Byte(writer, cast(u8)((count << 3) | kind)) }
+    else if count < 4096 { Little(writer, (count << 4) | 4 | kind, 2) }
+    else { Little(writer, (count << 4) | 12 | kind, 3) }
+    if run { Byte(writer, input[0]) }
+    else { Bytes(writer, input) }
+}
+
+FrameHeader :: (writer: *Writer, count: s64, window_log: s32) {
+    Little(writer, 0xfd2fb528, 4)
+    if count < 256 {
+        Byte(writer, 0x24)
+        Byte(writer, cast(u8)count)
+    } else if count < 65792 {
+        Byte(writer, 0x64)
+        Little(writer, cast(u64)(count - 256), 2)
+    } else {
+        single := count <= (cast(s64)1 << window_log)
+        Byte(writer, ifx single then 0xa4 else 0x84)
+        if !single { Byte(writer, cast(u8)((window_log - 10) << 3)) }
+        Little(writer, cast(u64)count, 4)
+    }
+}
+
+BlockHeader :: (writer: *Writer, size: s64, kind: u64, last: bool) {
+    Little(writer, (cast(u64)size << 3) | (kind << 1) | (ifx last then 1 else 0), 3)
+}
+
+#scope_export
+
+// Maximum space for a single frame, including content size and checksum.
+ZstdEncodeBound :: (input_count: s64) -> Frame.ZstdResult {
+    if input_count < 0 || input_count > MaxInput { return .{problem = .InvalidArgument} }
+    blocks: s64 = ifx input_count == 0 then 1 else (input_count + BlockSize - 1) / BlockSize
+    return .{count = input_count + blocks * 3 + 14}
+}
+
+// Compress a dictionary-free standard frame into disjoint caller storage.
+// Only output[:result.count] is usable on success. Discard output on failure.
+ZstdEncode :: (input: []u8, output: []u8, mode: ZstdEncodeMode = .High) -> Frame.ZstdResult {
+    if input.count < 0 || output.count < 0 || input.count > MaxInput ||
+        (mode != .Balanced && mode != .High) {
+        return .{problem = .InvalidArgument}
+    }
+    if output.count < 13 { return .{problem = .OutputLimit} }
+    high := mode == .High
+    window_log: s32 = ifx high then 24 else 21
+    // Small inputs need neither a full window ring nor a full hash table.
+    history_log := window_log
+    while history_log > 8 && (cast(s64)1 << (history_log - 1)) >= input.count { history_log -= 1 }
+    hash_log: s32 = ifx high then 20 else 17
+    while hash_log > 8 && (cast(s64)1 << hash_log) > input.count { hash_log -= 1 }
+    heads: Vec(u32)
+    long_heads: Vec(u32)
+    links: Vec(u32)
+    literals: Vec(u8)
+    sequences: Vec(Sequence)
+    scratch: Vec(u8)
+    defer {
+        VecFree(heads)
+        VecFree(long_heads)
+        VecFree(links)
+        VecFree(literals)
+        VecFree(sequences)
+        VecFree(scratch)
+    }
+    writer := Writer.{data = output}
+    FrameHeader(*writer, input.count, window_log)
+    if input.count == 0 {
+        BlockHeader(*writer, 0, 0, true)
+    } else {
+        hash_size := cast(s64)1 << hash_log
+        window_size := cast(s64)1 << history_log
+        work_size: s64 = ifx input.count < BlockSize then input.count else BlockSize
+        sequence_limit := work_size / 4
+        if !VecResizeBounded(heads, hash_size, hash_size) || (high && !VecResizeBounded(long_heads, hash_size, hash_size)) ||
+            !VecResizeBounded(links, window_size, window_size) ||
+            !VecResizeBounded(literals, work_size, work_size) || !VecResizeBounded(sequences, sequence_limit, MaxSequences) ||
+            !VecResizeBounded(scratch, work_size, work_size) { return .{problem = .Allocation} }
+        matcher := Matcher.{input = input, heads = heads[:], long_heads = long_heads[:], links = links[:], mask = window_size - 1,
+            shift = 32 - cast(u32)hash_log, attempts = ifx high then 24 else 12}
+        recent: [3]s64 = .{1, 4, 8}
+        at: s64 = 0
+        while at < input.count && !writer.full {
+            end := at + BlockSize
+            if end > input.count { end = input.count }
+            block := input[at:end]
+            last := end == input.count
+            if IsRun(block) {
+                AddPositions(*matcher, at, end)
+                BlockHeader(*writer, block.count, 1, last)
+                Byte(*writer, block[0])
+            } else {
+                block_recent := recent
+                count, literal_count := Parse(*matcher, at, end, block_recent[:], literals[:], sequences[:])
+                candidate := Writer.{data = scratch[:block.count]}
+                literal_bytes := literals[:literal_count]
+                if !WriteHuffman(*candidate, literal_bytes) { WriteRawLiterals(*candidate, literal_bytes) }
+                WriteSequences(*candidate, sequences[:count], high)
+                if !candidate.full && candidate.at < block.count {
+                    BlockHeader(*writer, candidate.at, 2, last)
+                    Bytes(*writer, scratch[:candidate.at])
+                    recent = block_recent
+                } else {
+                    BlockHeader(*writer, block.count, 0, last)
+                    Bytes(*writer, block)
+                }
+            }
+            at = end
+        }
+    }
+    if writer.full || writer.data.count - writer.at < 4 { return .{problem = .OutputLimit} }
+    Little(*writer, cast(u64)Tables.Checksum(input), 4)
+    return .{count = writer.at}
+}

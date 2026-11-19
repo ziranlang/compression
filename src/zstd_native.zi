@@ -1,0 +1,107 @@
+using Frame :: #import "zstd_frame"
+
+ZstdUltraLevel :: 22
+
+#scope_file
+
+zstd :: #system_library "zstd";
+MaximumLevel :: () -> s32 #foreign zstd "ZSTD_maxCLevel";
+CompressBound :: (count: usize) -> usize #foreign zstd "ZSTD_compressBound";
+CreateEncoder :: () -> *void #foreign zstd "ZSTD_createCCtx";
+FreeEncoder :: (context: *void) -> usize #foreign zstd "ZSTD_freeCCtx";
+EncoderParameter :: (context: *void, parameter: s32, value: s32) -> usize #foreign zstd "ZSTD_CCtx_setParameter";
+Compress :: (context: *void, output: *u8, capacity: usize, input: *u8, count: usize) -> usize #foreign zstd "ZSTD_compress2";
+FindFrameSize :: (input: *u8, count: usize) -> usize #foreign zstd "ZSTD_findFrameCompressedSize";
+DictionaryId :: (data: *u8, count: usize) -> u32 #foreign zstd "ZSTD_getDictID_fromDict";
+Decompress :: (output: *u8, capacity: usize, input: *u8, count: usize) -> usize #foreign zstd "ZSTD_decompress";
+CreateDecoder :: () -> *void #foreign zstd "ZSTD_createDCtx";
+FreeDecoder :: (context: *void) -> usize #foreign zstd "ZSTD_freeDCtx";
+DecompressWithDictionary :: (context: *void, output: *u8, capacity: usize, input: *u8, count: usize,
+    dictionary: *u8, dictionary_size: usize) -> usize #foreign zstd "ZSTD_decompress_usingDict";
+IsError :: (status: usize) -> u32 #foreign zstd "ZSTD_isError";
+ErrorCode :: (status: usize) -> s32 #foreign zstd "ZSTD_getErrorCode";
+
+CompressionLevel :: 100
+ChecksumFlag :: 201
+
+FitsSize :: (count: s64) -> bool {
+    return count >= 0 && cast(u64)count <= cast(u64)(~cast(usize)0)
+}
+
+Overlap :: (left: []u8, right: []u8) -> bool {
+    if left.count == 0 || right.count == 0 { return false }
+    a := cast(usize)*left[0]
+    b := cast(usize)*right[0]
+    if a <= b { return b - a < cast(usize)left.count }
+    return a - b < cast(usize)right.count
+}
+
+// Values from the public libzstd error enumeration, stable since 1.3.1.
+Result :: (status: usize) -> ZstdResult {
+    if IsError(status) == 0 { return .{count = cast(s64)status} }
+    code := ErrorCode(status)
+    if code == 22 { return .{problem = .Checksum} }
+    if code == 30 || code == 32 { return .{problem = .Dictionary} }
+    if code == 64 { return .{problem = .Allocation} }
+    if code == 70 { return .{problem = .OutputLimit} }
+    if code == 72 { return .{problem = .Truncated} }
+    return .{problem = .Format}
+}
+
+#scope_export
+
+ZstdEncodeBound :: (input_count: s64) -> ZstdResult {
+    if !FitsSize(input_count) { return .{problem = .InvalidArgument} }
+    bound := CompressBound(cast(usize)input_count)
+    if IsError(bound) != 0 || cast(u64)bound > 0x7fffffffffffffff { return .{problem = .InvalidArgument} }
+    return .{count = cast(s64)bound}
+}
+
+// Writes one standard frame with its content size and checksum recorded.
+// INPUT and OUTPUT must be disjoint. OUTPUT is usable only on success.
+ZstdEncode :: (input: []u8, output: []u8, level: s32 = ZstdUltraLevel) -> ZstdResult {
+    if level < 1 || level > ZstdUltraLevel || !FitsSize(input.count) || !FitsSize(output.count) ||
+        Overlap(input, output) { return .{problem = .InvalidArgument} }
+    if output.count == 0 { return .{problem = .OutputLimit} }
+    if level > MaximumLevel() { return .{problem = .Backend} }
+    context := CreateEncoder()
+    if context == null { return .{problem = .Allocation} }
+    defer { unused FreeEncoder(context) }
+    if IsError(EncoderParameter(context, CompressionLevel, level)) != 0 ||
+        IsError(EncoderParameter(context, ChecksumFlag, 1)) != 0 { return .{problem = .Backend} }
+    return Result(Compress(context, *output[0], cast(usize)output.count,
+        ifx input.count == 0 then null else *input[0], cast(usize)input.count))
+}
+
+// Decodes exactly one standard frame into caller storage. MAX_WINDOW is an
+// exact byte limit checked before libzstd runs. OUTPUT is usable only on success.
+ZstdDecode :: (input: []u8, output: []u8, max_window: u64) -> ZstdResult {
+    dictionary: []u8
+    return ZstdDecodeWithDictionary(input, output, max_window, dictionary)
+}
+
+// For frames with a dictionary ID, the formatted dictionary must carry that ID.
+ZstdDecodeWithDictionary :: (input: []u8, output: []u8, max_window: u64, dictionary: []u8) -> ZstdResult {
+    if !FitsSize(input.count) || !FitsSize(output.count) || !FitsSize(dictionary.count) ||
+        Overlap(input, output) || Overlap(dictionary, output) { return .{problem = .InvalidArgument} }
+    header := Frame.ZstdReadHeader(input)
+    if header.problem != .None { return .{problem = header.problem} }
+    if header.window > max_window { return .{problem = .WindowLimit} }
+    if header.has_content_size && header.content_size > cast(u64)output.count { return .{problem = .OutputLimit} }
+    if (header.dictionary_id != 0) != (dictionary.count != 0) { return .{problem = .Dictionary} }
+    if dictionary.count != 0 && DictionaryId(*dictionary[0], cast(usize)dictionary.count) != header.dictionary_id {
+        return .{problem = .Dictionary}
+    }
+    input_size := cast(usize)input.count
+    size := Result(FindFrameSize(*input[0], input_size))
+    if size.problem != .None { return size }
+    if size.count != input.count { return .{problem = .Trailing} }
+    destination := ifx output.count == 0 then null else *output[0]
+    capacity := cast(usize)output.count
+    if dictionary.count == 0 { return Result(Decompress(destination, capacity, *input[0], input_size)) }
+    context := CreateDecoder()
+    if context == null { return .{problem = .Allocation} }
+    defer { unused FreeDecoder(context) }
+    return Result(DecompressWithDictionary(context, destination, capacity, *input[0], input_size,
+        *dictionary[0], cast(usize)dictionary.count))
+}

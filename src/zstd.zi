@@ -1,0 +1,420 @@
+using Tables :: #import "zstd_tables"
+using Frame :: #import "zstd_frame"
+using Vectors :: #import "std/vec"
+
+#scope_file
+
+BlockLimit :: 131072
+
+Little :: (input: []u8) -> u64 {
+    word: u64
+    for at: cast(s64)0..input.count - 1 { word |= cast(u64)input[at] << cast(u64)(8 * at) }
+    return word
+}
+
+// FSE distributions are encoded from the beginning, low bits first. Permit
+// a short lookahead at EOF, but validate the actual number of bits consumed.
+ForwardBits :: struct { data: []u8; at: s64; bits: u32; count: s32; valid: bool }
+ForwardFill :: (reader: *ForwardBits, count: s32) {
+    while reader.count < count && reader.at < reader.data.count {
+        reader.bits |= cast(u32)reader.data[reader.at] << cast(u32)reader.count
+        reader.at += 1
+        reader.count += 8
+    }
+}
+ForwardRead :: (reader: *ForwardBits, count: s32) -> s32 {
+    if reader.count < count { reader.valid = false; return 0 }
+    value := reader.bits & ((cast(u32)1 << cast(u32)count) - 1)
+    reader.bits >>= cast(u32)count
+    reader.count -= count
+    return cast(s32)value
+}
+
+// Sequence and Huffman bitstreams start at their end marker and run backward.
+ReverseBits :: struct { data: []u8; at: s64; bits: u64; count: s32; valid: bool }
+ReverseStart :: (data: []u8) -> ReverseBits {
+    if data.count == 0 || data[data.count - 1] == 0 { return .{} }
+    tail := data[data.count - 1]
+    return .{data = data, at = data.count - 1, bits = cast(u64)tail,
+        count = Tables.Log2(cast(s32)tail), valid = true}
+}
+ReverseFill :: (reader: *ReverseBits, count: s32) -> bool {
+    while reader.count < count && reader.at > 0 {
+        reader.at -= 1
+        reader.bits = (reader.bits << 8) | cast(u64)reader.data[reader.at]
+        reader.count += 8
+    }
+    return reader.count >= count
+}
+ReversePeek :: (reader: *ReverseBits, count: s32) -> u64 {
+    return (reader.bits >> cast(u64)(reader.count - count)) & ((cast(u64)1 << cast(u64)count) - 1)
+}
+ReverseRead :: (reader: *ReverseBits, count: s32) -> u64 {
+    if !ReverseFill(reader, count) { reader.valid = false; return 0 }
+    value := ReversePeek(reader, count)
+    reader.count -= count
+    return value
+}
+ReverseDone :: (reader: *ReverseBits) -> bool { return reader.valid && reader.at == 0 && reader.count == 0 }
+
+// Returns the bytes occupied by the normalized counts or -1 on failure.
+FseRead :: (data: []u8, symbols: s32, max_log: s32, table: *Tables.FseTable) -> s64 {
+    counts: [256]s32
+    reader := ForwardBits.{data = data, valid = true}
+    ForwardFill(*reader, 4)
+    log := ForwardRead(*reader, 4) + 5
+    if log > max_log { return -1 }
+    threshold := cast(s32)1 << log
+    width := log + 1
+    remaining := threshold + 1
+    symbol: s32 = 0
+    while remaining > 1 && symbol < symbols && reader.valid {
+        ForwardFill(*reader, width)
+        short_limit := 2 * threshold - 1 - remaining
+        low := cast(s32)(reader.bits & cast(u32)(threshold - 1))
+        count: s32 = 0
+        if low < short_limit { count = ForwardRead(*reader, width - 1) }
+        else {
+            count = ForwardRead(*reader, width)
+            if count >= threshold { count -= short_limit }
+        }
+        count -= 1
+        counts[symbol] = count
+        remaining -= ifx count < 0 then 1 else count
+        if remaining < 1 { return -1 }
+        symbol += 1
+        if count == 0 {
+            repeat: s32 = 3
+            while repeat == 3 && reader.valid {
+                ForwardFill(*reader, 2)
+                repeat = ForwardRead(*reader, 2)
+                symbol += repeat
+                if symbol >= symbols { return -1 }
+            }
+        }
+        while remaining < threshold { threshold >>= 1; width -= 1 }
+    }
+    if !reader.valid || remaining != 1 || !Tables.FseBuild(table, counts[:symbols], log) { return -1 }
+    return reader.at - reader.count / 8
+}
+
+Huffman :: struct { entries: [2048]u16; log: s32 }
+
+HuffWeights :: (input: []u8, weights: []u8) -> s32 {
+    fse: Tables.FseTable
+    size := FseRead(input, 256, 6, *fse)
+    if size < 0 { return -1 }
+    reader := ReverseStart(input[size:])
+    if !reader.valid { return -1 }
+    states: [2]s64
+    for at: 0..1 { states[at] = cast(s64)ReverseRead(*reader, fse.log) }
+    if !reader.valid { return -1 }
+    for index: cast(s32)0..253 {
+        lane := index & 1
+        entry := fse.entries[states[lane]]
+        weights[index] = entry.symbol
+        if !ReverseFill(*reader, cast(s32)entry.bits) {
+            weights[index + 1] = fse.entries[states[1 - lane]].symbol
+            return index + 2
+        }
+        states[lane] = cast(s64)entry.base + cast(s64)ReverseRead(*reader, cast(s32)entry.bits)
+    }
+    return -1
+}
+
+// RFC 8878 §4.2. Build the canonical prefix lookup from symbol weights.
+HuffTable :: (input: []u8, table: *Huffman) -> s64 {
+    if input.count < 1 { return -1 }
+    weights: [256]u8
+    descriptor := cast(s32)input[0]
+    count: s32 = 0
+    size: s64 = 0
+    if descriptor < 128 {
+        size = 1 + descriptor
+        if size > input.count { return -1 }
+        count = HuffWeights(input[1:size], weights[:])
+        if count < 0 { return -1 }
+    } else {
+        count = descriptor - 127
+        size = 1 + (count + 1) / 2
+        if size > input.count { return -1 }
+        for index: cast(s32)0..count - 1 {
+            byte := input[1 + index / 2]
+            weights[index] = ifx (index & 1) == 0 then byte >> 4 else byte & 15
+        }
+    }
+    counts: [12]s32
+    total: s32 = 0
+    for index: cast(s32)0..count - 1 {
+        weight := cast(s32)weights[index]
+        if weight > 11 { return -1 }
+        if weight != 0 { total += cast(s32)1 << (weight - 1); counts[weight] += 1 }
+    }
+    log := Tables.Log2(total) + 1
+    if total == 0 || log > 11 { return -1 }
+    remainder := (cast(s32)1 << log) - total
+    if (remainder & (remainder - 1)) != 0 { return -1 }
+    last := Tables.Log2(remainder) + 1
+    weights[count] = cast(u8)last
+    counts[last] += 1
+    if counts[1] < 2 || (counts[1] & 1) != 0 { return -1 }
+    next: [12]s32
+    for weight: cast(s32)2..log {
+        next[weight] = next[weight - 1] + (counts[weight - 1] << (weight - 2))
+    }
+    for symbol: cast(s32)0..count {
+        weight := cast(s32)weights[symbol]
+        if weight == 0 { continue }
+        width := cast(s32)1 << (weight - 1)
+        code := cast(u16)((symbol << 8) | (log + 1 - weight))
+        for state: next[weight]..next[weight] + width - 1 { table.entries[state] = code }
+        next[weight] += width
+    }
+    table.log = log
+    return size
+}
+
+HuffStream :: (input: []u8, output: []u8, table: *Huffman) -> bool {
+    reader := ReverseStart(input)
+    if !reader.valid { return false }
+    for at: cast(s64)0..output.count - 1 {
+        unused ReverseFill(*reader, table.log)
+        available := ifx reader.count < table.log then reader.count else table.log
+        index := ReversePeek(*reader, available) << cast(u64)(table.log - available)
+        code := table.entries[cast(s64)index]
+        used := cast(s32)(code & 255)
+        if used > available || used == 0 { return false }
+        output[at] = cast(u8)(code >> 8)
+        reader.count -= used
+    }
+    return ReverseDone(*reader)
+}
+
+HuffLiterals :: (input: []u8, output: []u8, table: *Huffman, four_streams: bool) -> bool {
+    if !four_streams { return HuffStream(input, output, table) }
+    if input.count < 6 { return false }
+    chunk := (output.count + 3) / 4
+    if chunk * 3 > output.count { return false }
+    read: s64 = 6
+    for stream: cast(s64)0..3 {
+        start := stream * chunk
+        stop := ifx stream == 3 then output.count else start + chunk
+        width := ifx stream == 3 then input.count - read else cast(s64)Little(input[stream * 2:stream * 2 + 2])
+        if width > input.count - read || !HuffStream(input[read:read + width], output[start:stop], table) { return false }
+        read += width
+    }
+    return true
+}
+
+LiteralSection :: struct { bytes: []u8; size: s64; problem: Frame.ZstdProblem }
+
+Literals :: (input: []u8, state: *DecodeState, limit: s64) -> LiteralSection {
+    if input.count == 0 { return .{problem = .Format} }
+    format := cast(s64)((input[0] >> 2) & 3)
+    kind := input[0] & 3
+    size: s64 = 0
+    width: s64 = 0
+    start: s64 = 0
+    if kind < 2 {
+        start = ifx format == 3 then 3 else ifx format == 1 then 2 else 1
+        if start > input.count { return .{problem = .Format} }
+        size = cast(s64)(Little(input[:start]) >> cast(u64)(ifx start == 1 then 3 else 4))
+        width = ifx kind == 0 then size else 1
+    } else {
+        start = ifx format < 2 then 3 else format + 2
+        if start > input.count { return .{problem = .Format} }
+        bits: u64 = ifx format < 2 then 10 else ifx format == 2 then 14 else 18
+        value := Little(input[:start]) >> 4
+        size = cast(s64)(value & ((cast(u64)1 << bits) - 1))
+        width = cast(s64)(value >> bits)
+    }
+    if size > limit || width > input.count - start { return .{problem = .Format} }
+    end := start + width
+    if kind == 0 { return .{bytes = input[start:end], size = end} }
+    if state.literals.count < size && !VecResizeBounded(state.literals, size, limit) {
+        return .{problem = .Allocation}
+    }
+    bytes := state.literals[:size]
+    if kind == 1 {
+        for at: cast(s64)0..size - 1 { bytes[at] = input[start] }
+    } else {
+        streams := input[start:end]
+        if kind == 2 {
+            tree_size := HuffTable(streams, *state.huffman)
+            if tree_size < 0 { return .{problem = .Format} }
+            streams = streams[tree_size:]
+        }
+        if state.huffman.log == 0 || !HuffLiterals(streams, bytes, *state.huffman, format != 0) {
+            return .{problem = .Format}
+        }
+    }
+    return .{bytes = bytes, size = end}
+}
+
+SequenceKind :: enum s32 { Literal; Offset; Match }
+
+SequenceTable :: (source: []u8, mode: u8, kind: SequenceKind, table: *Tables.FseTable) -> s64 {
+    if mode == 3 { return ifx table.ready then 0 else -1 }
+    symbols: s32 = ifx kind == .Literal then 36 else ifx kind == .Match then 53 else 32
+    if mode == 2 { return FseRead(source, symbols, ifx kind == .Offset then 8 else 9, table) }
+    if mode == 1 {
+        if source.count == 0 || cast(s32)source[0] >= symbols { return -1 }
+        table.entries[0] = .{symbol = source[0]}
+        table.log = 0
+        table.ready = true
+        return 1
+    }
+    if kind == .Literal { return ifx Tables.FseBuild(table, Tables.LiteralDistribution[:], 6) then 0 else -1 }
+    if kind == .Match { return ifx Tables.FseBuild(table, Tables.MatchDistribution[:], 6) then 0 else -1 }
+    return ifx Tables.FseBuild(table, Tables.OffsetDistribution[:], 5) then 0 else -1
+}
+
+LiteralLength :: (reader: *ReverseBits, symbol: u8) -> s64 {
+    if symbol < 16 { return cast(s64)symbol }
+    index := cast(s64)symbol - 16
+    return cast(s64)Tables.LiteralBase[index] + cast(s64)ReverseRead(reader, Tables.LiteralBits[index])
+}
+MatchLength :: (reader: *ReverseBits, symbol: u8) -> s64 {
+    if symbol < 32 { return cast(s64)symbol + 3 }
+    index := cast(s64)symbol - 32
+    return cast(s64)Tables.MatchBase[index] + cast(s64)ReverseRead(reader, Tables.MatchBits[index])
+}
+NextState :: (reader: *ReverseBits, current: Tables.FseEntry) -> s64 {
+    return cast(s64)current.base + cast(s64)ReverseRead(reader, cast(s32)current.bits)
+}
+
+DecodeState :: struct {
+    huffman: Huffman
+    literal_table: Tables.FseTable
+    offset_table: Tables.FseTable
+    match_table: Tables.FseTable
+    recent: [3]s64
+    literals: Vec(u8)
+    used: s64
+}
+
+Sequences :: (state: *DecodeState, data: []u8, literals: []u8, output: []u8,
+    window: u64, block_limit: s64) -> Frame.ZstdProblem {
+    if data.count == 0 { return .Format }
+    count := cast(s64)data[0]
+    at: s64 = 1
+    if count == 255 {
+        if data.count < 3 { return .Format }
+        count = cast(s64)Little(data[1:3]) + 0x7f00
+        at = 3
+    } else if count >= 128 {
+        if data.count < 2 { return .Format }
+        count = (count - 128) * 256 + cast(s64)data[1]
+        at = 2
+        if count == 0 { return .Format }
+    }
+    if count == 0 {
+        if data.count != 1 { return .Format }
+        if literals.count > output.count - state.used { return .OutputLimit }
+        for index: cast(s64)0..literals.count - 1 { output[state.used + index] = literals[index] }
+        state.used += literals.count
+        return .None
+    }
+    if count > block_limit / 3 || at >= data.count || (data[at] & 3) != 0 { return .Format }
+    modes := data[at]
+    at += 1
+    table_size := SequenceTable(data[at:], modes >> 6, .Literal, *state.literal_table)
+    if table_size < 0 { return .Format }
+    at += table_size
+    table_size = SequenceTable(data[at:], (modes >> 4) & 3, .Offset, *state.offset_table)
+    if table_size < 0 { return .Format }
+    at += table_size
+    table_size = SequenceTable(data[at:], (modes >> 2) & 3, .Match, *state.match_table)
+    if table_size < 0 { return .Format }
+    at += table_size
+    reader := ReverseStart(data[at:])
+    if !reader.valid { return .Format }
+    literal_state := cast(s64)ReverseRead(*reader, state.literal_table.log)
+    offset_state := cast(s64)ReverseRead(*reader, state.offset_table.log)
+    match_state := cast(s64)ReverseRead(*reader, state.match_table.log)
+    used := state.used
+    literal_at: s64 = 0
+    for sequence: cast(s64)1..count {
+        literal := state.literal_table.entries[literal_state]
+        offset := state.offset_table.entries[offset_state]
+        match := state.match_table.entries[match_state]
+        offset_value := (cast(s64)1 << cast(s64)offset.symbol) + cast(s64)ReverseRead(*reader, cast(s32)offset.symbol)
+        match_length := MatchLength(*reader, match.symbol)
+        literal_length := LiteralLength(*reader, literal.symbol)
+        if sequence < count {
+            literal_state = NextState(*reader, literal)
+            match_state = NextState(*reader, match)
+            offset_state = NextState(*reader, offset)
+        }
+        if !reader.valid || literal_length > literals.count - literal_at ||
+            literal_length + match_length > block_limit - (used - state.used) { return .Format }
+        if literal_length + match_length > output.count - used { return .OutputLimit }
+        distance := Tables.RecentOffset(state.recent[:], offset_value, literal_length)
+        if distance < 1 || distance > used + literal_length || cast(u64)distance > window { return .Format }
+        for index: cast(s64)0..literal_length - 1 { output[used + index] = literals[literal_at + index] }
+        used += literal_length
+        literal_at += literal_length
+        for index: used..used + match_length - 1 { output[index] = output[index - distance] }
+        used += match_length
+    }
+    rest := literals.count - literal_at
+    if !ReverseDone(*reader) || rest > block_limit - (used - state.used) { return .Format }
+    if rest > output.count - used { return .OutputLimit }
+    for index: cast(s64)0..rest - 1 { output[used + index] = literals[literal_at + index] }
+    state.used = used + rest
+    return .None
+}
+
+#scope_export
+
+// Decode one standard dictionary-free frame. INPUT and OUTPUT must be
+// disjoint. No input is borrowed after the call. On failure discard OUTPUT.
+ZstdDecode :: (input: []u8, output: []u8, max_window: u64) -> Frame.ZstdResult {
+    header := Frame.ZstdReadHeader(input)
+    if header.problem != .None { return .{problem = header.problem} }
+    if header.window > max_window { return .{problem = .WindowLimit} }
+    if header.has_content_size && header.content_size > cast(u64)output.count { return .{problem = .OutputLimit} }
+    if header.dictionary_id != 0 { return .{problem = .Dictionary} }
+    destination := ifx header.has_content_size then output[:cast(s64)header.content_size] else output
+    block_limit: s64 = ifx header.window < BlockLimit then cast(s64)header.window else BlockLimit
+    state: DecodeState
+    state.recent = .{1, 4, 8}
+    defer VecFree(state.literals)
+    at := header.size
+    last := false
+    while !last {
+        if input.count - at < 3 { return .{problem = .Truncated} }
+        block := Little(input[at:at + 3])
+        at += 3
+        last = (block & 1) != 0
+        kind := (block >> 1) & 3
+        size := cast(s64)(block >> 3)
+        if kind == 3 || size > block_limit { return .{problem = .Format} }
+        width := ifx kind == 1 then 1 else size
+        if width > input.count - at { return .{problem = .Truncated} }
+        data := input[at:at + width]
+        at += width
+        if kind == 2 {
+            section := Literals(data, *state, block_limit)
+            if section.problem != .None { return .{problem = section.problem} }
+            problem := Sequences(*state, data[section.size:], section.bytes, destination, header.window, block_limit)
+            if problem != .None { return .{problem = problem} }
+        } else {
+            if size > destination.count - state.used { return .{problem = .OutputLimit} }
+            if kind == 0 {
+                for index: cast(s64)0..size - 1 { destination[state.used + index] = data[index] }
+            } else {
+                for index: cast(s64)0..size - 1 { destination[state.used + index] = data[0] }
+            }
+            state.used += size
+        }
+    }
+    if header.has_content_size && state.used != destination.count { return .{problem = .Format} }
+    if header.checksum {
+        if input.count - at < 4 { return .{problem = .Truncated} }
+        if cast(u32)Little(input[at:at + 4]) != Tables.Checksum(destination[:state.used]) { return .{problem = .Checksum} }
+        at += 4
+    }
+    if at != input.count { return .{problem = .Trailing} }
+    return .{count = state.used}
+}

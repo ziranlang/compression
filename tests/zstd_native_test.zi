@@ -1,0 +1,57 @@
+using Frame :: #import "zstd_frame"
+using Zstd :: #import "zstd_native"
+using Portable :: #import "zstd"
+
+Fail :: (message: string) -> s32 {
+    print("Zstandard: %\n", message)
+    return 1
+}
+
+Main :: () -> s32 {
+    input: [8192]u8
+    encoded: [8400]u8
+    decoded: [8192]u8
+    for at: 0..8191 { input[at] = cast(u8)(at % 59) }
+    bound := Zstd.ZstdEncodeBound(input.count)
+    if bound.problem != .None || bound.count > encoded.count || Zstd.ZstdEncodeBound(-1).problem != .InvalidArgument {
+        return Fail("compression bound")
+    }
+    frame := Zstd.ZstdEncode(input[:], encoded[:])
+    if frame.problem != .None || frame.count < 1 || frame.count > 512 { return Fail("level-22 compression") }
+    bytes := encoded[:frame.count]
+    header := Frame.ZstdReadHeader(bytes)
+    if header.problem != .None || !header.has_content_size || !header.checksum || header.content_size != 8192 ||
+        header.dictionary_id != 0 || header.window == 0 { return Fail("encoded frame header") }
+    read := Zstd.ZstdDecode(bytes, decoded[:], header.window)
+    if read.problem != .None || read.count != input.count { return Fail("decompressed size") }
+    for at: 0..8191 { if decoded[at] != input[at] { return Fail("decompressed bytes") } }
+    read = Portable.ZstdDecode(bytes, decoded[:], header.window)
+    if read.problem != .None || read.count != input.count { return Fail("portable decompressed size") }
+    for at: 0..8191 { if decoded[at] != input[at] { return Fail("portable decompressed bytes") } }
+    if Zstd.ZstdDecode(bytes, decoded[:], header.window - 1).problem != .WindowLimit ||
+        Zstd.ZstdDecode(bytes, decoded[:8191], header.window).problem != .OutputLimit {
+        return Fail("window and output bounds")
+    }
+    if Zstd.ZstdDecode(bytes, encoded[:], header.window).problem != .InvalidArgument ||
+        Zstd.ZstdEncode(input[:], input[:]).problem != .InvalidArgument ||
+        Zstd.ZstdEncode(input[:], encoded[:], 23).problem != .InvalidArgument ||
+        Zstd.ZstdEncode(input[:], encoded[:1]).problem != .OutputLimit {
+        return Fail("invalid arguments and encoder output bound")
+    }
+    for cut: cast(s64)0..frame.count - 1 {
+        if Zstd.ZstdDecode(bytes[:cut], decoded[:], header.window).problem == .None { return Fail("truncated frame") }
+    }
+    if Zstd.ZstdDecode(encoded[:frame.count + 1], decoded[:], header.window).problem != .Trailing {
+        return Fail("trailing bytes")
+    }
+    encoded[frame.count - 1] ^= 1
+    if Zstd.ZstdDecode(bytes, decoded[:], header.window).problem != .Checksum { return Fail("corrupt checksum") }
+    encoded[4] |= 8
+    if Zstd.ZstdDecode(bytes, decoded[:], header.window).problem != .Format { return Fail("reserved header bit") }
+
+    empty := Zstd.ZstdEncode(input[:0], encoded[:])
+    read = Zstd.ZstdDecode(encoded[:empty.count], decoded[:0], 0)
+    if empty.problem != .None || read.problem != .None || read.count != 0 { return Fail("empty frame") }
+    print("Zstandard native bounds and roundtrip passed\n")
+    return 0
+}

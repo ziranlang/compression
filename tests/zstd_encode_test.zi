@@ -1,0 +1,45 @@
+using Decode :: #import "zstd"
+using Encode :: #import "zstd_encode"
+using Frame :: #import "zstd_frame"
+
+#program_export
+Answer :: () -> s32 {
+    input: [2400]u8
+    output: [2448]u8
+    decoded: [2400]u8
+    for index: cast(s64)0..2399 {
+        input[index] = ifx index % 19 < 14 then cast(u8)(index % 7 + 130) else cast(u8)(index * 27 ^ index / 13)
+    }
+    bound := Encode.ZstdEncodeBound(2400)
+    if bound.problem != .None || bound.count > 2448 || Encode.ZstdEncodeBound(-1).problem != .InvalidArgument ||
+        Encode.ZstdEncodeBound(0x100000000).problem != .InvalidArgument { return 1 }
+    if Encode.ZstdEncode(input[:], output[:12]).problem != .OutputLimit { return 3 }
+    for variant: cast(s32)0..1 {
+        mode := ifx variant == 0 then Encode.ZstdEncodeMode.Balanced else Encode.ZstdEncodeMode.High
+        encoded := Encode.ZstdEncode(input[:], output[:bound.count], mode)
+        if encoded.problem != .None || encoded.count >= 1200 { return 4 }
+        header := Frame.ZstdReadHeader(output[:encoded.count])
+        if header.problem != .None || !header.checksum || !header.has_content_size || header.content_size != 2400 ||
+            header.window != 2400 || header.dictionary_id != 0 { return 5 }
+        result := Decode.ZstdDecode(output[:encoded.count], decoded[:], 2400)
+        if result.problem != .None || result.count != 2400 { return 6 }
+        for index: cast(s64)0..2399 { if input[index] != decoded[index] { return 7 } }
+        if Decode.ZstdDecode(output[:encoded.count], decoded[:], 2399).problem != .WindowLimit ||
+            Decode.ZstdDecode(output[:encoded.count], decoded[:2399], 2400).problem != .OutputLimit { return 8 }
+        if Decode.ZstdDecode(output[:encoded.count - 1], decoded[:], 2400).problem != .Truncated { return 9 }
+        if Encode.ZstdEncode(input[:], output[:encoded.count - 1], mode).problem != .OutputLimit { return 10 }
+        output[encoded.count] = 213
+        tight := Encode.ZstdEncode(input[:], output[:encoded.count], mode)
+        if tight.problem != .None || tight.count != encoded.count || output[encoded.count] != 213 { return 11 }
+        output[encoded.count - 1] ^= 1
+        if Decode.ZstdDecode(output[:encoded.count], decoded[:], 2400).problem != .Checksum { return 12 }
+    }
+    return 42
+}
+
+Main :: () -> s32 {
+    result := Answer()
+    if result != 42 { print("Zstandard pure encode test failed: %\n", result); return result }
+    print("Zstandard pure encode bounds and roundtrip passed\n")
+    return 0
+}

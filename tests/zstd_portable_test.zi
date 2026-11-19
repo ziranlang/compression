@@ -1,0 +1,29 @@
+// Reference Zstd 1.5.7 --ultra -22 --single-thread, with checksum.
+using Zstd :: #import "zstd"
+
+#program_export
+Answer :: () -> s32 {
+    frame: [140]u8 = .{
+        40, 181, 47, 253, 100, 5, 0, 245, 3, 0, 86, 144, 30, 9, 224, 57, 59, 55,
+        37, 27, 64, 29, 1, 27, 0, 27, 0, 27, 0, 208, 142, 253, 160, 142, 229, 138,
+        163, 223, 6, 19, 24, 226, 0, 255, 230, 71, 235, 39, 86, 5, 144, 42, 147, 133,
+        55, 37, 212, 66, 80, 116, 177, 14, 38, 173, 103, 166, 149, 9, 228, 106, 27, 224,
+        131, 74, 181, 246, 33, 101, 31, 74, 172, 70, 4, 36, 31, 48, 135, 58, 114, 25,
+        195, 172, 19, 18, 148, 62, 188, 181, 144, 17, 22, 19, 152, 154, 53, 169, 6, 10,
+        225, 1, 225, 141, 183, 86, 126, 238, 26, 169, 28, 106, 188, 102, 47, 180, 210, 245,
+        200, 50, 63, 190, 159, 9, 242, 12, 15, 0, 238, 126, 204, 233
+    }
+    decoded: [261]u8
+    result := Zstd.ZstdDecode(frame[:], decoded[:], 1024)
+    if result.problem != .None || result.count != 261 { return 1 }
+    for index: 0..260 {
+        value := (index * 37 ^ index / 5 ^ (index * index) / 7) % 9 + 97
+        if decoded[index] != cast(u8)value { return 2 }
+    }
+    for cut: 0..139 {
+        if Zstd.ZstdDecode(frame[:cut], decoded[:], 1024).problem == .None { return 3 }
+    }
+    frame[139] ^= 1
+    if Zstd.ZstdDecode(frame[:], decoded[:], 1024).problem != .Checksum { return 4 }
+    return 42
+}

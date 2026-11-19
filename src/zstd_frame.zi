@@ -1,0 +1,58 @@
+// RFC 8878 frame metadata. Reading a header does not validate the blocks.
+ZstdProblem :: enum s32 {
+    None; Truncated; Format; Trailing; WindowLimit; OutputLimit;
+    Dictionary; Checksum; Allocation; InvalidArgument; Backend
+}
+
+ZstdResult :: struct {
+    problem: ZstdProblem
+    count: s64
+}
+
+ZstdHeader :: struct {
+    problem: ZstdProblem
+    size: s64
+    window: u64
+    content_size: u64
+    dictionary_id: u32
+    has_content_size: bool
+    checksum: bool
+}
+
+#scope_file
+
+LittleEndian :: (input: []u8) -> u64 {
+    word: u64
+    for at: cast(s64)0..input.count - 1 {
+        word |= cast(u64)input[at] << cast(u64)(8 * at)
+    }
+    return word
+}
+
+#scope_export
+
+ZstdReadHeader :: (input: []u8) -> ZstdHeader {
+    if input.count < 5 { return .{problem = .Truncated} }
+    if LittleEndian(input[:4]) != 0xfd2fb528 { return .{problem = .Format} }
+    descriptor := input[4]
+    if (descriptor & 8) != 0 { return .{problem = .Format} }
+    single := (descriptor & 32) != 0
+    size_flag := cast(s64)(descriptor >> cast(u8)6)
+    dict_flag := cast(s64)(descriptor & 3)
+    dict_width := ifx dict_flag == 3 then 4 else dict_flag
+    size_width := ifx size_flag != 0 then cast(s64)1 << size_flag else ifx single then 1 else 0
+    dict_at: s64 = ifx single then 5 else 6
+    size_at := dict_at + dict_width
+    end := size_at + size_width
+    if input.count < end { return .{problem = .Truncated} }
+    size := LittleEndian(input[size_at:end])
+    if size_width == 2 { size += 256 }
+    window := size
+    if !single {
+        window_descriptor := input[5]
+        base := cast(u64)1 << (10 + cast(u64)(window_descriptor >> cast(u8)3))
+        window = base + (base >> cast(u64)3) * cast(u64)(window_descriptor & 7)
+    }
+    return .{size = end, window = window, content_size = size, has_content_size = size_width != 0,
+        dictionary_id = cast(u32)LittleEndian(input[dict_at:size_at]), checksum = (descriptor & 4) != 0}
+}

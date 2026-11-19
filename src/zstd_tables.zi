@@ -1,0 +1,130 @@
+Log2 :: (value: s32) -> s32 {
+    result: s32 = 0
+    while value > 1 { value >>= 1; result += 1 }
+    return result
+}
+
+FseEntry :: struct { symbol: u8; bits: u8; base: u16 }
+FseTable :: struct { entries: [512]FseEntry; log: s32; ready: bool }
+
+// RFC 8878 §4.1. Low-probability symbols occupy the high end. Spread the
+// remaining symbols with a step coprime to the power-of-two table size.
+FseBuild :: (table: *FseTable, counts: []s32, log: s32) -> bool {
+    size := cast(s32)1 << log
+    next: [256]s32
+    high := size - 1
+    for symbol: cast(s64)0..counts.count - 1 {
+        frequency := counts[symbol]
+        if frequency == -1 {
+            table.entries[high].symbol = cast(u8)symbol
+            high -= 1
+            next[symbol] = 1
+        } else { next[symbol] = frequency }
+    }
+    state: s32 = 0
+    step := size / 2 + size / 8 + 3
+    for symbol: cast(s64)0..counts.count - 1 {
+        for occurrence: cast(s32)1..counts[symbol] {
+            table.entries[state].symbol = cast(u8)symbol
+            state = (state + step) & (size - 1)
+            while state > high { state = (state + step) & (size - 1) }
+        }
+    }
+    if state != 0 { return false }
+    for index: cast(s32)0..size - 1 {
+        entry := *table.entries[index]
+        rank := next[entry.symbol]
+        if rank == 0 { return false }
+        next[entry.symbol] += 1
+        extra := log - Log2(rank)
+        entry.bits = cast(u8)extra
+        entry.base = cast(u16)((rank << extra) - size)
+    }
+    table.log = log
+    table.ready = true
+    return true
+}
+
+// The predefined FSE distributions and length tables below are from RFC 8878.
+// Copyright (c) 2021 IETF Trust and the persons identified as authors of the code. All rights reserved.
+// Redistribution and use in source and binary forms, with or without modification,
+// is permitted pursuant to, and subject to the license terms contained in, the
+// Revised BSD License set forth in Section 4.c of the IETF Trust’s Legal
+// Provisions Relating to IETF Documents (https://trustee.ietf.org/license-info).
+LiteralDistribution: [36]s32 = .{4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1};
+OffsetDistribution: [29]s32 = .{1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1};
+MatchDistribution: [53]s32 = .{1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1};
+
+LiteralBase: [20]s32 = .{16,18,20,22,24,28,32,40,48,64,128,256,512,1024,2048,4096,8192,16384,32768,65536};
+LiteralBits: [20]s32 = .{1,1,1,1,2,2,3,3,4,6,7,8,9,10,11,12,13,14,15,16};
+MatchBase: [21]s32 = .{35,37,39,41,43,47,51,59,67,83,99,131,259,515,1027,2051,4099,8195,16387,32771,65539};
+MatchBits: [21]s32 = .{1,1,1,1,2,2,3,3,4,4,5,7,8,9,10,11,12,13,14,15,16};
+
+// xxHash64 with seed zero, as used by Zstandard frame checksums.
+Prime1: u64 = 0x9e3779b185ebca87;
+Prime2: u64 = 0xc2b2ae3d27d4eb4f;
+Prime3: u64 = 0x165667b19e3779f9;
+Prime4: u64 = 0x85ebca77c2b2ae63;
+Prime5: u64 = 0x27d4eb2f165667c5;
+
+RotateLeft :: (value: u64, bits: u64) -> u64 { return (value << bits) | (value >> (64 - bits)) }
+HashLane :: (accumulator: u64, word: u64) -> u64 { return RotateLeft(accumulator + word * Prime2, 31) * Prime1 }
+
+// Checksum callers have a complete word. Fixed-width reads let native
+// compilers combine the byte loads without requiring host alignment or endian.
+Read32 :: (data: []u8, at: s64) -> u64 {
+    return cast(u64)data[at] | (cast(u64)data[at + 1] << 8) |
+        (cast(u64)data[at + 2] << 16) | (cast(u64)data[at + 3] << 24)
+}
+Read64 :: (data: []u8, at: s64) -> u64 { return Read32(data, at) | (Read32(data, at + 4) << 32) }
+
+Checksum :: (data: []u8) -> u32 {
+    hash := Prime5
+    at: s64 = 0
+    if data.count >= 32 {
+        lanes: [4]u64 = .{Prime1 + Prime2, Prime2, 0, cast(u64)0 - Prime1}
+        while data.count - at >= 32 {
+            lanes[0] = HashLane(lanes[0], Read64(data, at))
+            lanes[1] = HashLane(lanes[1], Read64(data, at + 8))
+            lanes[2] = HashLane(lanes[2], Read64(data, at + 16))
+            lanes[3] = HashLane(lanes[3], Read64(data, at + 24))
+            at += 32
+        }
+        hash = RotateLeft(lanes[0], 1) + RotateLeft(lanes[1], 7) + RotateLeft(lanes[2], 12) + RotateLeft(lanes[3], 18)
+        for lane: cast(s64)0..3 { hash = (hash ^ HashLane(0, lanes[lane])) * Prime1 + Prime4 }
+    }
+    hash += cast(u64)data.count
+    while data.count - at >= 8 {
+        hash = RotateLeft(hash ^ HashLane(0, Read64(data, at)), 27) * Prime1 + Prime4
+        at += 8
+    }
+    if data.count - at >= 4 {
+        hash = RotateLeft(hash ^ (Read32(data, at) * Prime1), 23) * Prime2 + Prime3
+        at += 4
+    }
+    while at < data.count {
+        hash = RotateLeft(hash ^ (cast(u64)data[at] * Prime5), 11) * Prime1
+        at += 1
+    }
+    hash = (hash ^ (hash >> 33)) * Prime2
+    hash = (hash ^ (hash >> 29)) * Prime3
+    return cast(u32)(hash ^ (hash >> 32))
+}
+
+// Explicit offsets change the recent-offset history. Codes 1–3 select from
+// it, with the no-literals remapping defined by RFC 8878 §3.1.1.5.
+RecentOffset :: (recent: []s64, value: s64, literals: s64) -> s64 {
+    if value > 3 {
+        recent[2] = recent[1]
+        recent[1] = recent[0]
+        recent[0] = value - 3
+        return recent[0]
+    }
+    index := value - (ifx literals == 0 then 0 else 1)
+    if index == 0 { return recent[0] }
+    offset := ifx index == 3 then recent[0] - 1 else recent[index]
+    if index >= 2 { recent[2] = recent[1] }
+    recent[1] = recent[0]
+    recent[0] = offset
+    return offset
+}

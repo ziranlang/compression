@@ -1,0 +1,81 @@
+using Native :: #import "zstd_native"
+using Portable :: #import "zstd"
+using Encode :: #import "zstd_encode"
+using Frame :: #import "zstd_frame"
+using Clock :: #import "std/timer_linux"
+#import "std/file"
+#import "std/text_tools"
+#import "std/byte_text_linux"
+#import "std/vec"
+
+Fixture :: struct { bytes: Vec(u8) }
+
+ReadFixture :: (path: string, fixture: *Fixture, cap: s64) -> bool {
+    file := OpenRead(path)
+    if !file.valid { return false }
+    defer CloseFile(file)
+    size := FileSize(file)
+    if size < 0 || size > cap || !VecResizeBounded(fixture.bytes, size, cap) { return false }
+    data := fixture.bytes[:]
+    at: s64 = 0
+    while at < size {
+        read := ReadAt(file, data[at:], at)
+        if read <= 0 { return false }
+        at += read
+    }
+    return true
+}
+
+WriteFixture :: (path: string, bytes: []u8) -> bool {
+    file := OpenReplace(path)
+    if !file.valid { return false }
+    defer CloseFile(file)
+    at: s64 = 0
+    while at < bytes.count {
+        written := WriteAt(file, bytes[at:], at)
+        if written <= 0 { return false }
+        at += written
+    }
+    return true
+}
+
+Main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 6 && argc != 7 { return 2 }
+    mode := TextFromCString(argv[1])
+    input_path := TextFromCString(argv[2])
+    output_path := TextFromCString(argv[3])
+    setting, setting_valid := TextInteger(TextFromCString(argv[4]))
+    iterations, iterations_valid := TextInteger(TextFromCString(argv[5]))
+    maximum: s64 = 268435456
+    if !setting_valid || !iterations_valid || setting < 0 || setting > maximum || iterations < 1 || iterations > 10000 { return 2 }
+    input: Fixture
+    output: Vec(u8)
+    dictionary: Fixture
+    defer { VecFree(input.bytes); VecFree(output); VecFree(dictionary.bytes) }
+    if !ReadFixture(input_path, *input, maximum) { return 3 }
+    if argc == 7 && !ReadFixture(TextFromCString(argv[6]), *dictionary, maximum) { return 3 }
+    size := setting
+    pure := mode == "high" || mode == "balanced"
+    if mode == "encode" || pure {
+        bound := ifx pure then Encode.ZstdEncodeBound(input.bytes.count) else Native.ZstdEncodeBound(input.bytes.count)
+        if bound.problem != .None { return 4 }
+        size = bound.count
+    } else if mode != "native" && mode != "portable" { return 2 }
+    if !VecResizeBounded(output, size, maximum) { return 4 }
+    result: Frame.ZstdResult
+    start := Clock.MonotonicNanoseconds()
+    for iteration: cast(s64)1..iterations {
+        if mode == "encode" { result = Native.ZstdEncode(input.bytes[:], output[:], cast(s32)setting) }
+        else if pure { result = Encode.ZstdEncode(input.bytes[:], output[:], ifx mode == "high" then .High else .Balanced) }
+        else if mode == "portable" { result = Portable.ZstdDecode(input.bytes[:], output[:], cast(u64)maximum) }
+        else { result = Native.ZstdDecodeWithDictionary(input.bytes[:], output[:], cast(u64)maximum, dictionary.bytes[:]) }
+        if result.problem != .None {
+            print("problem=%\n", cast(s32)result.problem)
+            return 5
+        }
+    }
+    elapsed := Clock.MonotonicNanoseconds() - start
+    if !WriteFixture(output_path, output[:result.count]) { return 6 }
+    print("bytes=% ns=% iterations=%\n", result.count, elapsed, iterations)
+    return 0
+}

@@ -8,3 +8,7 @@ ref = "master"
 
 [exports]
 inflate = "src/inflate.zi"
+zstd = "src/zstd.zi"
+zstd_encode = "src/zstd_encode.zi"
+zstd_frame = "src/zstd_frame.zi"
+zstd_native = "src/zstd_native.zi"
