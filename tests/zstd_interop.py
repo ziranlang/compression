@@ -56,6 +56,13 @@ def main():
                     assert (encoded[9] >> 1) & 3 == 2
                     assert encoded[12] & 3 == 2
                     assert encoded[17] < 128  # FSE-compressed Huffman weights.
+                    jump_table = 18 + encoded[17]
+                    first_stream_size = int.from_bytes(encoded[jump_table:jump_table + 2], 'little')
+                    assert first_stream_size > 0
+                    broken = bytearray(encoded)
+                    broken[jump_table + 6 + first_stream_size - 1] = 0
+                    frame.write_bytes(broken)
+                    refuse("portable", len(data), 2)
                 if mode != "encode" and data == mixed:
                     assert frame.stat().st_size < len(data) // 2
                     compressed = frame.read_bytes()

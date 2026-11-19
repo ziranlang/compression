@@ -175,19 +175,40 @@ HuffTable :: (input: []u8, table: *Huffman) -> s64 {
 }
 
 HuffStream :: (input: []u8, output: []u8, table: *Huffman) -> bool {
-    reader := ReverseStart(input)
-    if !reader.valid { return false }
+    if input.count == 0 || input[input.count - 1] == 0 { return false }
+    read := input.count - 1
+    tail := input[read]
+    count := Tables.Log2(cast(s32)tail)
+    bits: u64 = 0
+    if count != 0 { bits = cast(u64)tail << cast(u64)(64 - count) }
+    log := table.log
+    shift := cast(u64)(64 - log)
     for at: cast(s64)0..output.count - 1 {
-        unused ReverseFill(*reader, table.log)
-        available := ifx reader.count < table.log then reader.count else table.log
-        index := ReversePeek(*reader, available) << cast(u64)(table.log - available)
-        code := table.entries[cast(s64)index]
+        if count < log {
+            if read >= 4 {
+                read -= 4
+                // Match the stream's little-endian byte order. Keeping the
+                // live bits at the high end gives every lookup the same shift.
+                word := cast(u64)input[read] | (cast(u64)input[read + 1] << 8) |
+                    (cast(u64)input[read + 2] << 16) | (cast(u64)input[read + 3] << 24)
+                bits |= word << cast(u64)(32 - count)
+                count += 32
+            } else {
+                while count < log && read > 0 {
+                    read -= 1
+                    bits |= cast(u64)input[read] << cast(u64)(56 - count)
+                    count += 8
+                }
+            }
+        }
+        code := table.entries[cast(s64)(bits >> shift)]
         used := cast(s32)(code & 255)
-        if used > available || used == 0 { return false }
+        if used > count || used == 0 { return false }
         output[at] = cast(u8)(code >> 8)
-        reader.count -= used
+        bits <<= cast(u64)used
+        count -= used
     }
-    return ReverseDone(*reader)
+    return read == 0 && count == 0
 }
 
 HuffLiterals :: (input: []u8, output: []u8, table: *Huffman, four_streams: bool) -> bool {
