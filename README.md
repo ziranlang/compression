@@ -31,9 +31,13 @@ CompressAsset :: (asset: []u8, output: []u8) -> s64 {
 
 `.Balanced` has a window of up to 2 MiB and about 10 MiB of heap scratch for large inputs. `.High` is the default and uses a window of up to 16 MiB, longer-prefix matching and adaptive sequence tables, with about 73 MiB of heap scratch for large inputs. Both use Huffman literals when beneficial and emit raw or RLE blocks when they are smaller. These are package presets with their own speed and compression ratios. The native API exposes libzstd's numbered levels.
 
-`compression/zstd_native` is an opt-in C target binding. Import it and link with `-lzstd` on targets that supply the library. The pure Ziran modules build without libzstd. [libzstd API manual](https://facebook.github.io/zstd/doc/api_manual_latest.html)
+`compression/zstd_native` is an opt-in C target binding. Import it and link with `-lzstd` on targets that supply the library. The pure Ziran modules build without libzstd. [libzstd API manual](https://meta.github.io/zstd/doc/api_manual_latest.html)
 
 `ZstdEncodeBound` returns the capacity needed for `ZstdEncode`. Encoding defaults to level 22 with the frame checksum and content size enabled. The native decoder has the same output and window limits as the portable decoder. Use `ZstdDecodeWithDictionary` when the frame and formatted dictionary advertise the same nonzero ID. Both decoders take exactly one standard frame and reject trailing bytes, concatenated frames and skippable frames.
+
+Use `ZstdDecodeFrames` for a body containing one or more complete frames. It accepts skippable frames and applies the same window limit to every data frame. The output capacity bounds the sum of all decoded data. The sequence API requires dictionary-free frames and rejects corrupt, incomplete or unrecognized input. Use the result only when `problem` is `.None`.
+
+`ZstdOpenEncoder` creates a reusable streaming context with an explicit level and maximum window in bits (use `23` for 8 MiB). Each successful `ZstdWriteEncoder` step reports how much input it consumed and how much output to emit. Call it again with the unconsumed tail when `done` is false. Supply a nonempty output buffer disjoint from the input. Use `ZstdFlushEncoder` to emit pending bytes while keeping the frame open, or `ZstdFinishEncoder` to complete the checksummed frame. Repeat either call with fresh output space until `done` is true. `ZstdResetEncoder` discards the current frame and keeps the settings and context for reuse. Keep each context under one caller's ownership and release it with `ZstdFreeEncoder`.
 
 The format tables carry the IETF attribution and Revised BSD notice in [zstd_tables.zi](src/zstd_tables.zi). The optional native binding uses the system library under its upstream terms. [libzstd BSD license](https://github.com/meta/zstd/blob/v1.5.7/LICENSE) · [libzstd GPLv2 terms](https://github.com/meta/zstd/blob/v1.5.7/COPYING)
 

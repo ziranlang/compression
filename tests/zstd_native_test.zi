@@ -7,6 +7,125 @@ Fail :: (message: string) -> s32 {
     return 1
 }
 
+FrameSequence :: () -> bool {
+    first: [3]u8 = .[0, 1, 255]
+    second: [4]u8 = .[97, 98, 0, 99]
+    skippable: [10]u8 = .[0x5f, 0x2a, 0x4d, 0x18, 2, 0, 0, 0, 17, 42]
+    encoded: [192]u8
+    output: [7]u8
+    start := Zstd.ZstdEncode(first[:], encoded[:], 1)
+    if start.problem != .None {
+        return false
+    }
+    for index: 0..9 {
+        encoded[start.count + index] = skippable[index]
+    }
+    after_skip := start.count + skippable.count
+    end := Zstd.ZstdEncode(second[:], encoded[after_skip:], 1)
+    if end.problem != .None {
+        return false
+    }
+    size := after_skip + end.count
+    decoded := Zstd.ZstdDecodeFrames(encoded[:size], output[:], 4)
+    if decoded.problem != .None || decoded.count != 7 ||
+        output[0] != 0 || output[1] != 1 || output[2] != 255 ||
+        output[3] != 97 || output[4] != 98 || output[5] != 0 || output[6] != 99 {
+        return false
+    }
+    skipped := Zstd.ZstdDecodeFrames(skippable[:], output[:0], 0)
+    if skipped.problem != .None || skipped.count != 0 ||
+        Zstd.ZstdDecodeFrames(encoded[:size], output[:], 3).problem != .WindowLimit ||
+        Zstd.ZstdDecodeFrames(encoded[:size], output[:6], 4).problem != .OutputLimit ||
+        Zstd.ZstdDecodeFrames(encoded[:size], encoded[:], 4).problem != .InvalidArgument ||
+        Zstd.ZstdDecodeFrames(encoded[:size + 1], output[:], 4).problem == .None ||
+        Zstd.ZstdDecodeFrames(encoded[:size - 1], output[:], 4).problem == .None ||
+        Zstd.ZstdDecodeFrames(skippable[:9], output[:], 4).problem == .None ||
+        Zstd.ZstdDecodeFrames(encoded[:0], output[:], 4).problem != .Truncated ||
+        Zstd.ZstdDecode(encoded[:size], output[:], 4).problem != .Trailing {
+        return false
+    }
+    encoded[size - 1] ^= 1
+    return Zstd.ZstdDecodeFrames(encoded[:size], output[:], 4).problem == .Checksum
+}
+
+SequenceWithoutSizes :: () -> bool {
+    // Two raw data frames with a 1 KiB window and no declared content size.
+    input: [24]u8 = .[
+        0x28, 0xb5, 0x2f, 0xfd, 0, 0, 25, 0, 0, 10, 20, 30,
+        0x28, 0xb5, 0x2f, 0xfd, 0, 0, 25, 0, 0, 40, 50, 60
+    ]
+    dictionary: [10]u8 = .[0x28, 0xb5, 0x2f, 0xfd, 0x21, 1, 0, 1, 0, 0]
+    output: [6]u8
+    result := Zstd.ZstdDecodeFrames(input[:], output[:], 1024)
+    return result.problem == .None && result.count == 6 &&
+        output[0] == 10 && output[1] == 20 && output[2] == 30 &&
+        output[3] == 40 && output[4] == 50 && output[5] == 60 &&
+        Zstd.ZstdDecodeFrames(input[:], output[:5], 1024).problem == .OutputLimit &&
+        Zstd.ZstdDecodeFrames(input[:], output[:], 1023).problem == .WindowLimit &&
+        Zstd.ZstdDecodeFrames(dictionary[:], output[:], 1024).problem == .Dictionary
+}
+
+StreamRoundtrip :: () -> bool {
+    opened := Zstd.ZstdOpenEncoder(1, 16)
+    if opened.problem != .None { return false }
+    encoder := opened.encoder
+    defer { Zstd.ZstdFreeEncoder(*encoder) }
+    input: [180000]u8
+    encoded: [181000]u8
+    output: [180000]u8
+    random: u32 = 1
+    for at: 0..179999 {
+        random ^= random << 13
+        random ^= random >> 17
+        random ^= random << 5
+        input[at] = cast(u8)random
+    }
+    if Zstd.ZstdOpenEncoder(1, 9).problem != .InvalidArgument ||
+        Zstd.ZstdWriteEncoder(*encoder, input[:3], input[:4]).problem != .InvalidArgument ||
+        Zstd.ZstdWriteEncoder(*encoder, input[:3], encoded[:0]).problem != .OutputLimit {
+        return false
+    }
+    consumed: s64 = 0
+    written: s64 = 0
+    while consumed < 150000 {
+        step := Zstd.ZstdWriteEncoder(*encoder, input[consumed:150000], encoded[written:written + 257])
+        if step.problem != .None || step.consumed + step.written == 0 ||
+            (written == 0 && step.done) { return false }
+        consumed += step.consumed
+        written += step.written
+    }
+    flush := Zstd.ZstdFlushEncoder(*encoder, encoded[written:written + 1])
+    written += flush.written
+    if flush.problem != .None || flush.done ||
+        Zstd.ZstdFinishEncoder(*encoder, encoded[written:written + 1]).problem != .InvalidArgument {
+        return false
+    }
+    while !flush.done {
+        flush = Zstd.ZstdFlushEncoder(*encoder, encoded[written:written + 257])
+        if flush.problem != .None || (!flush.done && flush.written == 0) { return false }
+        written += flush.written
+    }
+    tail := Zstd.ZstdWriteEncoder(*encoder, input[consumed:], encoded[written:written + 257])
+    if tail.problem != .None || !tail.done || tail.consumed != 30000 { return false }
+    written += tail.written
+    while true {
+        finish := Zstd.ZstdFinishEncoder(*encoder, encoded[written:written + 257])
+        if finish.problem != .None || (!finish.done && finish.written == 0) { return false }
+        written += finish.written
+        if finish.done { break }
+    }
+    decoded := Portable.ZstdDecode(encoded[:written], output[:], 65536)
+    if decoded.problem != .None || decoded.count != input.count { return false }
+    for at: 0..179999 { if input[at] != output[at] { return false } }
+    if Zstd.ZstdFinishEncoder(*encoder, encoded[:]).problem != .InvalidArgument ||
+        Zstd.ZstdResetEncoder(*encoder) != .None { return false }
+    unused Zstd.ZstdWriteEncoder(*encoder, input[:17], encoded[:])
+    if Zstd.ZstdResetEncoder(*encoder) != .None { return false }
+    empty := Zstd.ZstdFinishEncoder(*encoder, encoded[:])
+    decoded = Zstd.ZstdDecode(encoded[:empty.written], output[:0], 0)
+    return empty.problem == .None && empty.done && decoded.problem == .None && decoded.count == 0
+}
+
 Main :: () -> s32 {
     input: [8192]u8
     encoded: [8400]u8
@@ -52,6 +171,9 @@ Main :: () -> s32 {
     empty := Zstd.ZstdEncode(input[:0], encoded[:])
     read = Zstd.ZstdDecode(encoded[:empty.count], decoded[:0], 0)
     if empty.problem != .None || read.problem != .None || read.count != 0 { return Fail("empty frame") }
+    if !FrameSequence() { return Fail("concatenated frame limits and roundtrip") }
+    if !SequenceWithoutSizes() { return Fail("sequence with unspecified decoded sizes") }
+    if !StreamRoundtrip() { return Fail("stream writes, flush, finish and reset") }
     print("Zstandard native bounds and roundtrip passed\n")
     return 0
 }

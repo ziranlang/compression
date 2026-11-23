@@ -91,6 +91,18 @@ def main():
         refuse("native", 0, 2)
         refuse("portable", 0, 2)
 
+        skipped = frame.read_bytes()
+        first = call("zstd", "-q", "-c", input=mixed).stdout
+        second = call("zstd", "-q", "-c", input=entropy).stdout
+        sequence = first + skipped + second
+        expected = mixed + entropy
+        frame.write_bytes(sequence)
+        assert call("zstd", "-q", "-d", "-c", frame).stdout == expected
+        decode("frames", expected)
+        refuse("frames", len(expected) - 1, 5)
+        frame.write_bytes(sequence[:-1] + bytes([sequence[-1] ^ 1]))
+        refuse("frames", len(expected), 7)
+
         samples = []
         for index in range(28):
             sample = directory / f"sample-{index:02}"
@@ -106,7 +118,7 @@ def main():
         refuse("native", 9991, 6)
         refuse("native", 9991, 6, wrong)
         refuse("portable", 9991, 6)
-    print("Zstandard CLI interoperability passed (pure encode, Ultra-22, Huffman, raw/RLE, unknown lengths and dictionaries)")
+    print("Zstandard CLI interoperability passed (pure encode, Ultra-22, Huffman, raw/RLE, frame sequences and dictionaries)")
 
 
 if __name__ == "__main__":

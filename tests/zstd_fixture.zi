@@ -56,11 +56,12 @@ Main :: (argc: s32, argv: **u8) -> s32 {
     if argc == 7 && !ReadFixture(TextFromCString(argv[6]), *dictionary, maximum) { return 3 }
     size := setting
     pure := mode == "high" || mode == "balanced"
+    if mode == "frames" && argc == 7 { return 2 }
     if mode == "encode" || pure {
         bound := ifx pure then Encode.ZstdEncodeBound(input.bytes.count) else Native.ZstdEncodeBound(input.bytes.count)
         if bound.problem != .None { return 4 }
         size = bound.count
-    } else if mode != "native" && mode != "portable" { return 2 }
+    } else if mode != "native" && mode != "portable" && mode != "frames" { return 2 }
     if !VecResizeBounded(output, size, maximum) { return 4 }
     result: Frame.ZstdResult
     start := Clock.MonotonicNanoseconds()
@@ -68,6 +69,7 @@ Main :: (argc: s32, argv: **u8) -> s32 {
         if mode == "encode" { result = Native.ZstdEncode(input.bytes[:], output[:], cast(s32)setting) }
         else if pure { result = Encode.ZstdEncode(input.bytes[:], output[:], ifx mode == "high" then .High else .Balanced) }
         else if mode == "portable" { result = Portable.ZstdDecode(input.bytes[:], output[:], cast(u64)maximum) }
+        else if mode == "frames" { result = Native.ZstdDecodeFrames(input.bytes[:], output[:], cast(u64)maximum) }
         else { result = Native.ZstdDecodeWithDictionary(input.bytes[:], output[:], cast(u64)maximum, dictionary.bytes[:]) }
         if result.problem != .None {
             print("problem=%\n", cast(s32)result.problem)

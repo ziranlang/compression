@@ -22,7 +22,21 @@ IsError :: (status: usize) -> u32 #foreign zstd "ZSTD_isError";
 ErrorCode :: (status: usize) -> s32 #foreign zstd "ZSTD_getErrorCode";
 
 CompressionLevel :: 100
+WindowLog :: 101
 ChecksumFlag :: 201
+
+StreamBuffer :: struct {
+    data: *u8
+    size: usize
+    position: usize
+}
+
+StreamMode :: enum s32 { Write; Flush; Finish }
+EncoderState :: enum s32 { Closed; Active; Flushing; Finishing; Finished; Failed }
+RunEncoder :: (context: *void, output: *StreamBuffer, input: *StreamBuffer,
+    mode: StreamMode) -> usize #foreign zstd "ZSTD_compressStream2";
+ResetEncoder :: (context: *void, directive: s32) -> usize #foreign zstd "ZSTD_CCtx_reset";
+ResetSessionOnly :: 1
 
 FitsSize :: (count: s64) -> bool {
     return count >= 0 && cast(u64)count <= cast(u64)(~cast(usize)0)
@@ -48,7 +62,108 @@ Result :: (status: usize) -> ZstdResult {
     return .{problem = .Format}
 }
 
+SkippableFrame :: (input: []u8) -> bool {
+    return input.count >= 4 && (input[0] & cast(u8)0xf0) == 0x50 &&
+        input[1] == 0x2a && input[2] == 0x4d && input[3] == 0x18
+}
+
 #scope_export
+
+// Each encoder owns one context. Use it from one caller at a time and free it
+// when done. Reset reuses the context and its settings for a new frame.
+ZstdEncoder :: struct {
+    context: *void
+    state: EncoderState
+}
+
+ZstdEncoderOpen :: struct {
+    encoder: ZstdEncoder
+    problem: ZstdProblem
+}
+
+ZstdEncoderStep :: struct {
+    consumed: s64
+    written: s64
+    done: bool
+    problem: ZstdProblem
+}
+
+ZstdOpenEncoder :: (level: s32, window_log: s32) -> ZstdEncoderOpen {
+    if level < 1 || level > ZstdUltraLevel || window_log < 10 || window_log > 30 {
+        return .{problem = .InvalidArgument}
+    }
+    if level > MaximumLevel() { return .{problem = .Backend} }
+    context := CreateEncoder()
+    if context == null { return .{problem = .Allocation} }
+    if IsError(EncoderParameter(context, CompressionLevel, level)) != 0 ||
+        IsError(EncoderParameter(context, WindowLog, window_log)) != 0 ||
+        IsError(EncoderParameter(context, ChecksumFlag, 1)) != 0 {
+        unused FreeEncoder(context)
+        return .{problem = .Backend}
+    }
+    return .{encoder = .{context = context, state = .Active}}
+}
+
+ZstdResetEncoder :: (encoder: *ZstdEncoder) -> ZstdProblem {
+    if encoder == null || encoder.context == null { return .InvalidArgument }
+    if IsError(ResetEncoder(encoder.context, ResetSessionOnly)) != 0 {
+        encoder.state = .Failed
+        return .Backend
+    }
+    encoder.state = .Active
+    return .None
+}
+
+ZstdFreeEncoder :: (encoder: *ZstdEncoder) {
+    if encoder == null || encoder.context == null { return }
+    unused FreeEncoder(encoder.context)
+    encoder.context = null
+    encoder.state = .Closed
+}
+
+#scope_file
+StreamStep :: (encoder: *ZstdEncoder, input: []u8, output: []u8, mode: StreamMode) -> ZstdEncoderStep {
+    if encoder == null || encoder.context == null ||
+        !FitsSize(input.count) || !FitsSize(output.count) || Overlap(input, output) {
+        return .{problem = .InvalidArgument}
+    }
+    if output.count == 0 { return .{problem = .OutputLimit} }
+    if encoder.state != .Active && !(mode == .Flush && encoder.state == .Flushing) &&
+        !(mode == .Finish && encoder.state == .Finishing) {
+        return .{problem = .InvalidArgument}
+    }
+    source: StreamBuffer = .{
+        data = ifx input.count == 0 then null else *input[0],
+        size = cast(usize)input.count
+    }
+    destination: StreamBuffer = .{data = *output[0], size = cast(usize)output.count}
+    status := Result(RunEncoder(encoder.context, *destination, *source, mode))
+    if status.problem != .None {
+        encoder.state = .Failed
+        return .{problem = status.problem}
+    }
+    done := ifx mode == .Write then source.position == source.size else status.count == 0
+    if mode == .Flush { encoder.state = ifx done then .Active else .Flushing }
+    if mode == .Finish { encoder.state = ifx done then .Finished else .Finishing }
+    return .{consumed = cast(s64)source.position, written = cast(s64)destination.position, done = done}
+}
+
+#scope_export
+// Pass the unconsumed tail again when done is false. Retain the written prefix
+// of each successful step before reusing the output buffer.
+ZstdWriteEncoder :: (encoder: *ZstdEncoder, input: []u8, output: []u8) -> ZstdEncoderStep {
+    return StreamStep(encoder, input, output, .Write)
+}
+
+ZstdFlushEncoder :: (encoder: *ZstdEncoder, output: []u8) -> ZstdEncoderStep {
+    empty: []u8
+    return StreamStep(encoder, empty, output, .Flush)
+}
+
+ZstdFinishEncoder :: (encoder: *ZstdEncoder, output: []u8) -> ZstdEncoderStep {
+    empty: []u8
+    return StreamStep(encoder, empty, output, .Finish)
+}
 
 ZstdEncodeBound :: (input_count: s64) -> ZstdResult {
     if !FitsSize(input_count) { return .{problem = .InvalidArgument} }
@@ -78,6 +193,47 @@ ZstdEncode :: (input: []u8, output: []u8, level: s32 = ZstdUltraLevel) -> ZstdRe
 ZstdDecode :: (input: []u8, output: []u8, max_window: u64) -> ZstdResult {
     dictionary: []u8
     return ZstdDecodeWithDictionary(input, output, max_window, dictionary)
+}
+
+// Decode a sequence of dictionary-free frames into one bounded output. A
+// skippable frame contributes no output. Discard the output on any error.
+ZstdDecodeFrames :: (input: []u8, output: []u8, max_window: u64) -> ZstdResult {
+    if !FitsSize(input.count) || !FitsSize(output.count) || Overlap(input, output) {
+        return .{problem = .InvalidArgument}
+    }
+    if input.count == 0 {
+        return .{problem = .Truncated}
+    }
+    offset: s64 = 0
+    declared_capacity := cast(u64)output.count
+    while offset < input.count {
+        remaining := input[offset:]
+        if !SkippableFrame(remaining) {
+            header := Frame.ZstdReadHeader(remaining)
+            if header.problem != .None {
+                return .{problem = header.problem}
+            }
+            if header.window > max_window {
+                return .{problem = .WindowLimit}
+            }
+            if header.dictionary_id != 0 {
+                return .{problem = .Dictionary}
+            }
+            if header.has_content_size {
+                if header.content_size > declared_capacity {
+                    return .{problem = .OutputLimit}
+                }
+                declared_capacity -= header.content_size
+            }
+        }
+        size := Result(FindFrameSize(*remaining[0], cast(usize)remaining.count))
+        if size.problem != .None {
+            return size
+        }
+        offset += size.count
+    }
+    destination := ifx output.count == 0 then null else *output[0]
+    return Result(Decompress(destination, cast(usize)output.count, *input[0], cast(usize)input.count))
 }
 
 // For frames with a dictionary ID, the formatted dictionary must carry that ID.
